@@ -1,0 +1,11 @@
+# 체크포인트는 용량이 커서 git 대신 Drive/Git LFS 등으로 관리 권장
+experiments/*/checkpoints/
+
+# 실제 ADNI 원본 데이터는 절대 git에 커밋하지 않음 (데이터 사용 협약 위반 방지)
+data/raw/
+*.csv
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store

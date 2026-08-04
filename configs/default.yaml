@@ -1,0 +1,74 @@
+experiment:
+  name: "baseline_atinv"
+  # 아래 세 시드는 서로 독립적으로 바꿀 수 있습니다.
+  # 이 조합이 곧 하나의 "연구 경우의 수"이며 exp_id는 자동으로 재계산됩니다.
+  model_init_seed: 42        # 가중치 초기화 / 학습 중 dropout 등
+  split_seed: 42             # 환자를 train/val/test로 나누는 시드
+  modality_dropout_seed: 42  # 어떤 모달리티를 결측 처리할지 결정하는 시드
+  output_root: "experiments"
+
+data:
+  mode: "synthetic"          # "synthetic" | "adni_csv"
+  n_rois: 68
+  axes: ["A", "T", "I", "N", "V"]
+  modalities: ["blood", "csf", "mri", "pet", "genetics", "cognition"]
+  train_frac: 0.7
+  val_frac: 0.15
+  # test_frac = 1 - train_frac - val_frac
+
+  # 모달리티 강건성 실험용: 0이면 결측 시뮬레이션 없음.
+  # 0.3이면 방문마다 평균 30% 확률로 (blood/csf/mri/pet 중) 결측 처리.
+  max_modality_dropout: 0.0
+
+  synthetic:
+    n_patients: 200
+    n_visits_min: 3
+    n_visits_max: 8
+    visit_gap_months_mean: 6
+
+  adni:
+    # --- 확보됨 (2026-07-31) ---
+    dxsum_csv: null    # DXSUM_31Jul2026.csv
+    cdr_csv: null       # CDR_31Jul2026.csv
+    mmse_csv: null       # MMSE_31Jul2026.csv
+    adas_csv: null       # ADAS_31Jul2026.csv
+    # --- 아직 없음 (mask=False로 처리됨, 확보 시 채우면 자동 반영) ---
+    apoe_csv: null           # 예: All_Subjects_APOERES_*.csv
+    blood_csv: null          # 예: 노트북의 plasma 파일들을 RID+VISCODE로 재추출한 결과
+    csf_biomarker_csv: null  # 예: All_Subjects_UPENNBIOMK_ROCHE_ELECSYS_*.csv (RID+VISCODE 유지)
+    mri_roi_csv: null        # 예: UCSFFSX51/UCSFFSX6 FreeSurfer ROI (GPU 확보 후)
+    pet_roi_csv: null        # 예: UCBERKELEYAV45/AV1451 SUVR (GPU 확보 후)
+    adnimerge_csv: null      # 선택: 인구통계 공변량 필요해지면 CSV로 export
+    visit_window_months: 6
+
+model:
+  latent_dim_per_axis: 8       # 축(A/T/I/N/V)당 ROI별 embedding 차원
+  hidden_dim: 128
+  reaction_type: "transformer" # "transformer" | "mlp"
+  reaction_layers: 2
+  reaction_heads: 4
+  learnable_graph: true
+  graph_init: "identity"       # "identity" | "template"
+  adjacency_csv: null          # graph_init: template 일 때 사용
+  sde_steps_per_interval: 4    # 두 방문 사이를 몇 스텝으로 나눠 적분할지
+  noise_scale_init: 0.05
+
+training:
+  batch_size: 8
+  epochs: 200
+  lr: 0.001
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  amp: true                    # GPU에서만 적용됨
+  checkpoint_every_steps: 200
+  log_every_steps: 20
+  resume: true
+  early_stop_patience: 30
+  num_workers: 2
+
+loss:
+  recon_weight: 1.0
+  kl_weight: 0.1
+  anchor_weight: 0.5    # z_N 요약값 vs CDRSB monotonic 정렬
+  ordering_weight: 0.2  # A → T 순서 제약
+  diag_aux_weight: 0.3  # 보조 진단 분류 head
