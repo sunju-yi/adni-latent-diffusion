@@ -1,0 +1,152 @@
+---
+title: "ADNIMERGE2-Package-Building"
+output: 
+  rmarkdown::html_vignette:
+    toc: false
+    code_folding: hide
+date: "Last Updated: `r format(Sys.Date(), '%B %d, %Y')`"
+vignette: >
+  %\VignetteIndexEntry{ADNIMERGE2-Package-Building}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+bibliography: "`r system.file('references.bib', package = 'ADNIMERGE2')`"
+biblio-style: "apalike"
+nocite: |
+  @rpkgsPackages2e @uscAlzheimersDisease
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  warning = FALSE,
+  message = FALSE,
+  echo = FALSE
+)
+```
+
+# Introduction
+
+The document describes the procedure to build an R data package from source `.csv` files with similar workflow of `ADNIMERGE2` R package. 
+
+# Building an R Package from csv files
+
+## Create R Package Project
+
+Clone the [https://github.com/atri-biostats/ADNIMERGE2](https://github.com/atri-biostats/ADNIMERGE2) repository. This will create the following directories:
+   
+   + [`data-raw`](https://github.com/atri-biostats/ADNIMERGE2/tree/main/data-raw): to store raw-data
+   + [`R`](https://github.com/atri-biostats/ADNIMERGE2/tree/main/R): to store package-specific defined function that includes utils function
+   + [`man`](https://github.com/atri-biostats/ADNIMERGE2/tree/main/R): to store roxygen2 documentation of functions/data in the package
+   + [`vignettes`](https://github.com/atri-biostats/ADNIMERGE2/tree/main/vignettes): to store guidance documents/articles about the package if necessary
+   + [`tests`](https://github.com/atri-biostats/ADNIMERGE2/tree/main/tests): to store package related test and retest scripts and will be checked during package building
+   + [`inst`](https://github.com/atri-biostats/ADNIMERGE2/tree/main/inst): to store any files that will not be exported to the package, and that will be stored as system file including any external data that is not in R data format (i.e., `.rda`/`.Rdata`) 
+   + [`tools`](https://github.com/atri-biostats/ADNIMERGE2/tree/main/tools): to store auxiliary files that needed during package configuration
+   
+Or create an R package project locally, which can be created using [usethis::create_package](https://usethis.r-lib.org/reference/create_package.html) function, and add package-specific metadata into the local package directory, please refer to  [https://r-pkgs.org/description.html](https://r-pkgs.org/description.html) for more information. Once the package-specific metadata is created, copy the pre-defined scripts/functions as necessary from the [ADNIMERGE2 github repository](https://github.com/atri-biostats/ADNIMERGE2) with the same file path to your local package project directory.
+
+## Download the ADNI Study Data
+
+Download the ADNI study data from the data-shared platform at [https://adni.loni.usc.edu/data-samples/adni-data/](https://adni.loni.usc.edu/data-samples/adni-data/) either in `*.zip` or `*.csv` file format, and store the files in [`./data-raw`](https://github.com/atri-biostats/ADNIMERGE2/tree/main/data-raw) directory
+
+ + Required to download a data dictionary `*.csv` file
+ 
+ + It is recommended to download files from the data-sharing platform on the same date. If the data is download from `Analysis Ready Cohort (ARC) Build/Table`, it is recommended to download the file without adding any prefix to the file name as highlighted in the following figure.
+   
+<img src="../man/figures/arc_table_template.png" align="center" height="70" alt = " " />
+
+
+### Required ADNI Study Data
+
+Here are some of the datasets that would be required to replicate `ADNIMERGE2` R package.
+
+<details>
+<summary>Show ADNIMERGE2 Required Datasets</summary>
+
+```{r dataset-list, echo = FALSE}
+# Libraries
+library(tidyverse)
+library(ADNIMERGE2)
+library(DT)
+
+source(system.file("dataset-list.R", package = "ADNIMERGE2", mustWork = TRUE))
+
+dataset_list <- get_required_dataset_list(
+  use_type = "article",
+  add_url_link = TRUE
+) %>%
+  mutate(text = case_when(
+    !is.na(script_list) ~ paste0(article_list, ",", script_list),
+    TRUE ~ article_list
+  )) %>%
+  arrange(data_code) %>%
+  concat_dataset_url(.data = ., var_name = "data_code") %>%
+  select(
+    `Dataset Code` = data_code,
+    `Dataset Label` = label,
+    `Use Articles/Scripts` = article_list,
+    `Derived Dataset` = source_derived_data
+  ) %>%
+  DT::datatable(.,
+    options = list(paging = FALSE, searchable = TRUE, bInfo = FALSE),
+    escape = FALSE,
+    caption = "List of datasets that requwired to replicated ADNIMERGE2 R data package"
+  )
+dataset_list
+```
+
+</details>
+
+## Build Package 
+
+The next step is start building the package by sourcing [`./tools/build.R`](https://github.com/atri-biostats/ADNIMERGE2/tree/main//tools/build.R) script file. The [./tools/build.R](https://github.com/atri-biostats/ADNIMERGE2/tree/main//tools/build.R) script file is used to prepare dataset, generate documentations and finalize package building. The main procedures in this script are presented as follows: 
+
++ Data preparation: 
+    
+  - [`./data-raw/data-prep.R`](https://github.com/atri-biostats/ADNIMERGE2/tree/main/data-raw/data-prep.R): 
+         
+     + To store all dataset in *`./data`* directory using [`usethis::use_data()`](https://usethis.r-lib.org/reference/use_data.html)
+         
+     + Some additional data preparation, please see  [here](https://github.com/atri-biostats/ADNIMERGE2/tree/main/data-raw/data_prep.R) for more information.
+         
+     + Required to specify two input arguments: data download date (`DATA_DOWNLOADED_DATE`) in `YYYY-MM-DD` format and a Boolean value to update any existing data dictionary file (`UPDATE_DATADIC`)
+         
+  - [`./data-raw/data-prep-recode.R`](https://github.com/atri-biostats/ADNIMERGE2/tree/main/data-raw/data_prep_recode.R):
+         
+     + To map numerically coded values of a dataset based on existing data dictionary as necessary
+         
+     + Required to specify indicator argument regarding whether to use an updated data dictionary (`USE_UPDATED_DATADIC`) if the data dictionary was updated in previous step
+  
+  - [`./data-raw/data-prep-category-pkgdown.R`](https://github.com/atri-biostats/ADNIMERGE2/tree/main/data-raw/data-prep-category-pkgdown.R): 
+   
+    + To create dataset category based on file path, file name or file content
+    
+    + Useful for data documentation and organizing dataset list in the [Reference](https://atri-biostats.github.io/ADNIMERGE2/reference/index.html) section of a package website that will be created using [pkgdown](https://pkgdown.r-lib.org/) R package.
+   
+  - [`./tools/generate-derived-data.R`](https://github.com/atri-biostats/ADNIMERGE2/tree/main/tools/generate-derived-data.R):  
+      
+      + To create some derived dataset based on files in the [`vignettes`](https://github.com/atri-biostats/ADNIMERGE2/tree/main/vignettes) directory
+         
+      + Required to specify the name of derived dataset (`DERIVED_DATASET_LIST`) as an input argument
+      
+      + **NOTE:** At this moment, Preclinical Alzheimer Cognitive Composite (PACC) scores derived data will only be created internally due to not all required raw-input data are available at the data-sharing platform. Please refer to [ADNIMERGE2-PACC](https://atri-biostats.github.io/ADNIMERGE2/articles/ADNIMERGE2-PACC.html#import-raw-datasets) and [`./tools/generate-pacc-input-data.R`](https://github.com/atri-biostats/ADNIMERGE2/blob/main/tools/generate-pacc-input-data.R) for more information. 
+      
+         * We suggest to set the `INCLUDE_PACC_DERIVED_DATA` value to `FALSE` for not generating PACC scores data. 
+         
+         * Moreover, [`vignettes-yaml.R`](https://github.com/atri-biostats/ADNIMERGE2/blob/main/tools/vignettes-yaml.R) script will allows to change the default parameter yaml value related to PACC in package vignettes.
+      
++ Generate data-related documentations:
+    
+   - To create roxygen2 documentation for the available datasets in the [`./data`](https://github.com/atri-biostats/ADNIMERGE2/tree/main/data) directory. 
+   
+   - [`./tools/document.R`](https://github.com/atri-biostats/ADNIMERGE2/tree/main/tools/document.R):
+        
+      + To generate documentations for both raw and derived data based on the actual data values, and data dictionary
+        
+      + Required two input arguments: a Boolean value to use the updated data dictionary (`USE_UPDATED_DATADIC`) if it is existed, and name of derived dataset list (`DERIVED_DATASET_LIST`).
+          
++ Build the data package: using [devtools R package](https://devtools.r-lib.org/)
+
+# References {-}
+
+<div id="refs"></div>

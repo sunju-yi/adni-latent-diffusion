@@ -1,0 +1,27 @@
+Package: ADNIMERGE2
+Type: Package
+Title: ADNI Study Data Package
+Description: This is an R data package for the Alzheimer's Disease Neuroimaging Initiative (ADNI) study.
+Version: 0.1.1
+Authors@R: person("ATRI Biostatistics", email = "biostat_request@atrihub.io",
+  role = c("aut", "cre"))
+BugReports: https://github.com/atri-biostats/ADNIMERGE2/issues
+URL: https://atri-biostats.github.io/ADNIMERGE2
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: true
+LazyDataCompression: bzip2
+Imports: stringr, rlang, dplyr, tibble, assertr, magrittr, rmarkdown,
+        tidyselect, purrr, tidyr, cli, readr, stats, bookdown
+Suggests: knitr, tidyverse, DT, metacore, metatools, admiral,
+        admiraldev, xportr, labelled, measurements, gtsummary,
+        testthat, htmltools, sdtm.oak, sdtmchecks, ggplot2, see, lme4,
+        marginaleffects, performance, survival, msm, minqa, consort,
+        scales, broom
+Depends: R (>= 3.5)
+RoxygenNote: 7.3.3
+VignetteBuilder: knitr
+NeedsCompilation: no
+Packaged: 2025-12-17 22:04:07 UTC; kedirhussen
+Author: ATRI Biostatistics [aut, cre]
+Maintainer: ATRI Biostatistics <biostat_request@atrihub.io>

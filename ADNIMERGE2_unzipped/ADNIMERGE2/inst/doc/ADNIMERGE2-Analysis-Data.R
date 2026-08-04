@@ -1,0 +1,836 @@
+## ----setup, include = FALSE---------------------------------------------------
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  warning = FALSE,
+  message = FALSE,
+  class.source = "fold-show"
+)
+options(rmarkdown.html_vignette.check_title = FALSE)
+# Data print function
+datatable <- function(data, paging = FALSE, searchable = TRUE, bInfo = FALSE, ...) {
+  DT::datatable(
+    data = data, ...,
+    options = list(
+      paging = paging, searchable = searchable, bInfo = bInfo,
+      ...
+    )
+  )
+}
+
+## ----setup-libraries----------------------------------------------------------
+library(tidyverse)
+library(assertr)
+library(metacore)
+library(metatools)
+library(admiral)
+library(admiraldev)
+library(xportr)
+
+## ----system-utils-summary, echo = FALSE---------------------------------------
+bind_rows(
+  c(
+    fun_name = "convert_metacore_to_tibble",
+    source = "metacore",
+    text = "Convert R6-wrapper metacore object to tibble form"
+  ),
+  c(
+    fun_name = "single_build_from_derived",
+    source = "metatools",
+    text = "Build from single derived data that required multiple datasets as input"
+  ),
+  c(
+    fun_name = "convert_var_to_fct_wrapper",
+    source = "metatools",
+    text = "Convert multiple variables into factor - a wrapper function of `convert_var_to_fct`"
+  ),
+  c(
+    fun_name = "create_amystatus_cols",
+    source = "internal",
+    text = "Create a common baseline amyloid status from multiple image tracer and resolutions"
+  )
+) %>%
+  select(
+    `Internal Function` = fun_name,
+    `Package Source` = source,
+    `Description` = text
+  ) %>%
+  datatable(searchable = FALSE, bInfo = FALSE)
+
+## ----prep-meta-data, echo = FALSE---------------------------------------------
+# Convert `R6-class` object into a data.frame
+meta_data_dic <- convert_metacore_to_tibble(METACORES) %>%
+  mutate(
+    TYPE = str_to_upper(string = type),
+    DERIVED = TRUE,
+    FLDNAME = variable
+  ) %>%
+  select(
+    TBLNAME = dataset, CRFNAME = dataset.label, structure,
+    FLDNAME, LABEL = label, TYPE, DERIVED, type, variable
+  )
+
+## ----adsl-data-dic-print, class.source = NULL, echo = FALSE-------------------
+adsl_data_dic <- meta_data_dic %>%
+  filter(TBLNAME == "ADSL")
+
+adsl_data_dic %>%
+  select(FLDNAME, LABEL, TYPE) %>%
+  datatable(data, paging = TRUE)
+
+## ----adsl-data-dic, echo = FALSE----------------------------------------------
+adsl_metacore <- METACORES %>%
+  select_dataset(dataset = "ADSL", simplify = FALSE)
+
+## ----generate-adsl0-----------------------------------------------------------
+ADSL <- build_from_derived(
+  metacore = adsl_metacore,
+  ds_list = list("DM" = DM, "GF" = GF),
+  predecessor_only = TRUE,
+  keep = "ALL"
+) %>%
+  assert_uniq(USUBJID) %>%
+  # Create AGE Group - creating categorical group from numeric
+  create_cat_var(
+    data = .,
+    metacore = adsl_metacore,
+    ref_var = AGE,
+    grp_var = AGEGR1,
+    num_grp_var = AGEGR1N
+  ) %>%
+  # Adjust for multiple race groups
+  mutate(RACE = case_when(
+    str_detect(RACE, "\\|") ~ "More than one race",
+    str_detect(RACE, "Native Hawaiian$|^Other Pacific Islander") ~ "Native Hawaiian or Other Pacific Islander",
+    TRUE ~ as.character(RACE)
+  )) %>%
+  # Re-code RACE
+  create_var_from_codelist(
+    data = .,
+    metacore = adsl_metacore,
+    input_var = RACE,
+    out_var = RACEN,
+    decode_to_code = TRUE
+  ) %>%
+  # Add baseline DX
+  derive_vars_merged(
+    dataset = .,
+    dataset_add = RS,
+    filter_add = RSTESTCD == "DX" & RSBLFL == "Y",
+    new_vars = exprs(DX = RSORRES),
+    order = exprs(VISITNUM),
+    mode = "last",
+    by_vars = exprs(STUDYID, USUBJID),
+    check_type = "error",
+    relationship = "one-to-one"
+  ) %>%
+  # Convert to factor with Control Terms (CT)
+  convert_var_to_fct_wrapper(
+    .data = .,
+    metacore = adsl_metacore,
+    var = c("ORIGPROT", "DX", "RACE")
+  ) %>%
+  # Add baseline education level and marital status
+  call_derivation(
+    dataset = .,
+    dataset_add = SC,
+    derivation = derive_vars_merged,
+    variable_params = list(
+      params(
+        filter_add = SCTESTCD == "PTEDUCAT" & SCBLFL == "Y",
+        new_vars = exprs(EDUC = SCSTRESN)
+      ),
+      params(
+        filter_add = SCTESTCD == "PTMARRY" & SCBLFL == "Y",
+        new_vars = exprs(MARISTAT = SCORRES)
+      )
+    ),
+    order = exprs(VISITNUM),
+    mode = "first",
+    by_vars = exprs(STUDYID, USUBJID),
+    check_type = "error",
+    relationship = "one-to-one"
+  ) %>%
+  # Add baseline BMI derived from weight and height
+  call_derivation(
+    dataset = .,
+    dataset_add = VS,
+    derivation = derive_vars_merged,
+    variable_params = list(
+      params(
+        filter_add = VSTESTCD == "WEIGHT" & VSBLFL == "Y",
+        new_vars = exprs(WEIGHT = VSSTRESN)
+      ),
+      params(
+        filter_add = VSTESTCD == "HEIGHT" & VSBLFL == "Y",
+        new_vars = exprs(HEIGHT = VSSTRESN)
+      )
+    ),
+    order = exprs(VISITNUM),
+    mode = "first",
+    by_vars = exprs(USUBJID),
+    check_type = "error",
+    relationship = "one-to-one"
+  ) %>%
+  mutate(
+    BMI = round(compute_bmi(height = HEIGHT, weight = WEIGHT), 2),
+    BMIBLU = ifelse(!is.na(BMI), "kg/m^2", NA_character_),
+    AGEU = ifelse(!is.na(AGEU), "Years", NA_character_)
+  )
+
+## ----generate-adsl1-----------------------------------------------------------
+# Add baseline amyloid status
+NV_AMYSTAT_COLS <- NV %>%
+  select(NVTESTCD, NVTEST, NVCAT, NVSCAT) %>%
+  distinct() %>%
+  filter(str_detect(NVTESTCD, "AMYSTAT")) %>%
+  mutate(IMAGE_RES = str_extract_all(NVSCAT, "8MM$|6MM$")) %>%
+  filter(str_detect(IMAGE_RES, "8|6")) %>%
+  mutate(NVTESTCD_NVSCAT = paste0(NVTESTCD, "0", str_replace_all(NVSCAT, "-", "_")))
+
+nv_params <- lapply(NV_AMYSTAT_COLS$NVTESTCD_NVSCAT, function(param) {
+  params_cond <- admiral::params(
+    filter_add = NVCAT == "AMYLOIDPET" &
+      NVSCAT == stringr::str_replace(stringr::str_split(!!param, "0", simplify = TRUE)[2], "_", "-") &
+      NVTESTCD == stringr::str_split(!!param, "0", simplify = TRUE)[1] &
+      NVBLFL == "Y",
+    new_vars = exprs(!!!exprs(param = NVSTRESC))
+  )
+  params_cond$new_vars <- substitute(
+    exprs(param := NVSTRESC),
+    list(param = as.name(param))
+  )
+  return(params_cond)
+})
+
+ADSL <- ADSL %>%
+  call_derivation(
+    dataset = .,
+    dataset_add = NV,
+    derivation = derive_vars_merged,
+    variable_params = nv_params,
+    order = exprs(VISITNUM), # For duplicated cases
+    mode = "first",
+    by_vars = exprs(USUBJID),
+    check_type = "error",
+    relationship = "one-to-one"
+  )
+
+# Required to create a common amyloid status variable from
+# multiple image tracers and resolutions
+ADSL <- ADSL %>%
+  create_amystatus_cols(.) %>%
+  select(-any_of(NV_AMYSTAT_COLS$NVTESTCD_NVSCAT))
+
+## ----generate-adsl2-----------------------------------------------------------
+# Add baseline questionnaire/assessment score
+qs_params <- lapply(unique(QS$QSTESTCD), function(param) {
+  params_cond <- admiral::params(
+    filter_add = QSTESTCD == !!param & QSBLFL == "Y",
+    new_vars = exprs(!!!exprs(param = QSORRES))
+  )
+  params_cond$new_vars <- substitute(
+    exprs(param := as.numeric(QSORRES)),
+    list(param = as.name(param))
+  )
+  return(params_cond)
+})
+
+ADSL <- ADSL %>%
+  call_derivation(
+    dataset = .,
+    dataset_add = QS,
+    derivation = derive_vars_merged,
+    variable_params = qs_params,
+    order = exprs(VISITNUM),
+    mode = "first",
+    by_vars = exprs(USUBJID),
+    check_type = "error",
+    relationship = "one-to-one"
+  )
+
+## ----generate-adsl3-----------------------------------------------------------
+ADSL <- ADSL %>%
+  # Create enrollment flag
+  derive_var_merged_ef_msrc(
+    dataset = .,
+    by_vars = exprs(STUDYID, USUBJID),
+    flag_events = list(
+      flag_event(dataset_name = "DM", condition = !is.na(RFSTDTC))
+    ),
+    source_datasets = list(DM = DM),
+    new_var = ENRLFL,
+    true_value = "Y",
+    false_value = NA_character_
+  ) %>%
+  # Imputation for death date and enrollment end date
+  # Required partial date/time format/character format
+  rename("EOSDTHC" = EOSDT) %>%
+  select(-DTHDT) %>%
+  mutate(
+    ENRLDT = as.Date(ENRLDT),
+    EOSDTHC = as.character(EOSDTHC),
+    DTHDTC = as.character(DTHDTC)
+  ) %>%
+  call_derivation(
+    dataset = .,
+    derivation = derive_vars_dtm,
+    variable_params = list(
+      params(dtc = DTHDTC, new_vars_prefix = "DTH"),
+      params(dtc = EOSDTHC, new_vars_prefix = "EOS")
+    ),
+    highest_imputation = "M",
+    date_imputation = "mid",
+    flag_imputation = "auto",
+    min_dates = exprs(ENRLDT)
+  ) %>%
+  derive_vars_dtm_to_dt(
+    dataset = .,
+    source_vars = exprs(DTHDTM, EOSDTM)
+  ) %>%
+  # Remove any columns that are not specified in the meta-specs
+  drop_unspec_vars(
+    dataset = .,
+    metacore = adsl_metacore
+  ) %>%
+  # Add variable labels
+  metatools::set_variable_labels(
+    data = .,
+    metacore = adsl_metacore
+  )
+
+## ----checks-adsl1-------------------------------------------------------------
+ADSL <- ADSL %>%
+  # Check all variables specified are present and no more
+  check_variables(
+    data = .,
+    metacore = adsl_metacore
+  ) %>%
+  # Checks all variables with CT only contain values within the CT
+  check_ct_data(
+    data = .,
+    metacore = adsl_metacore,
+    na_acceptable = TRUE,
+    omit_vars = c("ENRLFL", "DTHFL")
+  ) %>%
+  # Orders the columns according to the spec
+  order_cols(
+    data = .,
+    metacore = adsl_metacore
+  ) %>%
+  # Sort the dataset based on key columns
+  sort_by_key(
+    data = .,
+    metacore = adsl_metacore
+  ) %>%
+  # Check uniqueness of record by key columns
+  check_unique_keys(
+    data = .,
+    metacore = adsl_metacore
+  )
+
+## ----checks-adsl0-------------------------------------------------------------
+ADSL <- ADSL %>%
+  xportr_metadata(
+    .df = .,
+    metadata = adsl_metacore,
+    domain = "ADSL",
+    verbose = "stop"
+  ) %>%
+  # Check variable type with specs match
+  # xportr_type() %>%
+  # Assign variable value length from the meta specs
+  xportr_length() %>%
+  # Assign variable label from meta specs and
+  # checks variable label length for max of 40 characters
+  xportr_label() %>%
+  # Checks variable format
+  xportr_format()
+
+## ----adae-data-dic-print, class.source = NULL, echo = FALSE-------------------
+adae_data_dic <- meta_data_dic %>%
+  filter(TBLNAME == "ADAE")
+
+adae_data_dic %>%
+  select(FLDNAME, LABEL, TYPE) %>%
+  datatable(data, paging = TRUE)
+
+## ----adae-data-dic------------------------------------------------------------
+adae_metacore <- METACORES %>%
+  select_dataset(.data = ., dataset = "ADAE", simplify = FALSE)
+
+## ----generate-adae------------------------------------------------------------
+# Modified user-defined function
+ADAE <- build_from_derived(
+  metacore = adae_metacore,
+  ds_list = list("ADSL" = ADSL, "AE" = AE),
+  predecessor_only = TRUE,
+  keep = FALSE
+) %>%
+  # Only subject that had at least one adverse events experience
+  filter(USUBJID %in% c(AE$USUBJID)) %>%
+  verify(nrow(.) == nrow(AE)) %>%
+  # Add adverse events onset and ended date
+  derive_vars_merged(
+    dataset = .,
+    dataset_add = AE %>%
+      select(USUBJID, AETERM, AESEQ, AESTDTC, AEENDTC),
+    by_vars = exprs(USUBJID, AETERM, AESEQ),
+    new_vars = NULL,
+    check_type = "error",
+    relationship = "one-to-one"
+  ) %>%
+  # AESTDTC and AEENDTC required to be a character variable
+  mutate(
+    ENRLDT = as.Date(ENRLDT),
+    AESTDTC = as.character(AESTDTC),
+    AEENDTC = as.character(AEENDTC)
+  ) %>%
+  # Add imputed date death date from ADSL
+  derive_vars_merged(
+    dataset = .,
+    dataset_add = ADSL %>%
+      select(USUBJID, STUDYID, DTHDT),
+    by_vars = exprs(USUBJID, STUDYID),
+    new_vars = NULL,
+    check_type = "error",
+    relationship = "many-to-one"
+  ) %>%
+  # Derive analysis start and end date
+  call_derivation(
+    dataset = .,
+    derivation = derive_vars_dtm,
+    variable_params = list(
+      params(
+        dtc = AESTDTC, new_vars_prefix = "AST", highest_imputation = "M",
+        date_imputation = "first", time_imputation = "first"
+      ),
+      params(
+        dtc = AEENDTC, new_vars_prefix = "AEN", highest_imputation = "M",
+        date_imputation = "last", time_imputation = "last",
+        max_dates = exprs(DTHDT)
+      )
+    ),
+    flag_imputation = "auto",
+    min_dates = exprs(ENRLDT)
+  ) %>%
+  # Convert into date format
+  derive_vars_dtm_to_dt(
+    dataset = .,
+    source_vars = exprs(ASTDTM, AENDTM)
+  ) %>%
+  # Derive analysis start/end relative day and
+  derive_vars_dy(
+    reference_date = ENRLDT,
+    source_vars = exprs(ASTDT, AENDT)
+  ) %>%
+  # Derive analysis duration (value and unit)
+  derive_vars_duration(
+    new_var = ADURN,
+    new_var_unit = ADURU,
+    start_date = ASTDT,
+    end_date = AENDT,
+    in_unit = "days",
+    out_unit = "days",
+    add_one = TRUE,
+    trunc_out = FALSE
+  ) %>%
+  drop_unspec_vars(
+    dataset = .,
+    metacore = adae_metacore
+  ) %>%
+  metatools::set_variable_labels(
+    data = .,
+    metacore = adae_metacore
+  )
+
+## ----check-adae---------------------------------------------------------------
+ADAE <- ADAE %>%
+  check_variables(
+    data = .,
+    metacore = adae_metacore
+  ) %>%
+  # check_ct_data(
+  #   data = .,
+  #   metacore = adae_metacore,
+  #   na_acceptable = TRUE
+  # ) %>%
+  order_cols(
+    data = .,
+    metacore = adae_metacore
+  ) %>%
+  sort_by_key(
+    data = .,
+    metacore = adae_metacore
+  ) %>%
+  check_unique_keys(
+    data = .,
+    metacore = adae_metacore
+  ) %>%
+  xportr_metadata(
+    .df = .,
+    metadata = adae_metacore,
+    verbose = "stop"
+  ) %>%
+  # xportr_type() %>%
+  xportr_length() %>%
+  xportr_label() %>%
+  xportr_format()
+
+## ----adqs-data-dic-print, class.source = NULL, echo = FALSE-------------------
+adqs_data_dic <- meta_data_dic %>%
+  filter(TBLNAME == "ADQS")
+
+adqs_data_dic %>%
+  select(FLDNAME, LABEL, TYPE) %>%
+  datatable(data, paging = TRUE)
+
+## ----adqs-data-dic------------------------------------------------------------
+adqs_metacore <- METACORES %>%
+  select_dataset(dataset = "ADQS", simplify = FALSE)
+
+## ----adqs-data-prep-----------------------------------------------------------
+# Assumed all questionnaire parameters are continuous (numeric)
+ADQS <- single_build_from_derived(
+  metacore = adqs_metacore,
+  dataset_name = "ADQS",
+  ds_list = list("QS" = QS),
+  predecessor_only = TRUE,
+  keep = "ALL"
+) %>%
+  # Add variables from ADSL dataset
+  derive_vars_merged(
+    dataset = .,
+    dataset_add = single_build_from_derived(
+      metacore = adqs_metacore,
+      dataset_name = "ADQS",
+      ds_list = list("ADSL" = ADSL),
+      predecessor_only = TRUE,
+      keep = "ALL"
+    ),
+    by_vars = exprs(STUDYID, USUBJID),
+    new_vars = NULL,
+    check_type = "error",
+    relationship = "many-to-one"
+  ) %>%
+  verify(nrow(.) == nrow(QS)) %>%
+  mutate(ADT = as.Date(ADT)) %>%
+  # Re-code PARAMN
+  # Assumed all PARAMCD are coded in the meta-specs
+  create_var_from_codelist(
+    data = .,
+    metacore = adqs_metacore,
+    input_var = PARAMCD,
+    out_var = PARAMN,
+    decode_to_code = TRUE
+  ) %>%
+  # Add analysis timing variable
+  derive_vars_dy(
+    reference_date = ENRLDT,
+    source_vars = exprs(ADT)
+  ) %>%
+  mutate(
+    AVISIT = case_when(
+      ADT <= ENRLDT | !is.na(ABLFL) ~ "BASELINE",
+      TRUE ~ VISIT
+    ),
+    AVISITN = case_when(
+      ADT <= ENRLDT | !is.na(ABLFL) ~ 0,
+      TRUE ~ ADY
+    )
+  ) %>%
+  # # Flag baseline records if the flag is not presented in QS derived dataset
+  # restrict_derivation(
+  #   derivation = derive_var_extreme_flag,
+  #   args = params(
+  #     by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+  #     order = exprs(ADT),
+  #     new_var = ABLFL,
+  #     mode = "last"
+  #   ),
+  #   filter = !is.na(AVAL) & ADT <= ENRLDT
+  # ) %>%
+  # Derive baseline and change from baseline variables
+  # Only applicable for continuous parameters
+  derive_var_base(
+    by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+    source_var = AVAL,
+    new_var = BASE
+  ) %>%
+  # Derive change for post-baseline records
+  restrict_derivation(
+    derivation = derive_var_chg,
+    filter = AVISITN > 0
+  ) %>%
+  # Derive percentage change for post-baseline records
+  restrict_derivation(
+    derivation = derive_var_pchg,
+    filter = AVISITN > 0
+  ) %>%
+  # Derive sequence number
+  derive_var_obs_number(
+    by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+    order = exprs(PARAMCD, ADT),
+    new_var = ASEQ,
+    check_type = "none" # "error"
+  ) %>%
+  drop_unspec_vars(
+    dataset = .,
+    metacore = adqs_metacore
+  ) %>%
+  metatools::set_variable_labels(
+    data = .,
+    metacore = adqs_metacore
+  )
+
+## ----check-adqs---------------------------------------------------------------
+ADQS <- ADQS %>%
+  check_variables(
+    data = .,
+    metacore = adqs_metacore
+  ) %>%
+  check_ct_data(
+    data = .,
+    metacore = adqs_metacore,
+    na_acceptable = TRUE,
+    omit_vars = c("ENRLFL", "ABLFL")
+  ) %>%
+  order_cols(
+    data = .,
+    metacore = adqs_metacore
+  ) %>%
+  sort_by_key(
+    data = .,
+    metacore = adqs_metacore
+  ) %>%
+  # check_unique_keys(
+  #   data = .,
+  #   metacore = adqs_metacore
+  # ) %>%
+  xportr_metadata(
+    .df = .,
+    metadata = adqs_metacore,
+    verbose = "stop"
+  ) %>%
+  # xportr_type() %>%
+  xportr_length() %>%
+  xportr_label()
+
+## ----generate-adadas----------------------------------------------------------
+ADADAS <- ADQS %>%
+  filter(PARAMCD == "ADASTT13")
+
+## ----adrs-data-dic-print, class.source = NULL, echo = FALSE-------------------
+adrs_data_dic <- meta_data_dic %>%
+  filter(TBLNAME == "ADRS")
+
+adrs_data_dic %>%
+  select(FLDNAME, LABEL, TYPE) %>%
+  datatable(data, paging = TRUE)
+
+## ----adrs-data-dic------------------------------------------------------------
+adrs_metacore <- METACORES %>%
+  select_dataset(dataset = "ADRS", simplify = FALSE)
+
+## ----adrs-data-prep-----------------------------------------------------------
+# Merge ADSL to RS
+adsl_vars <- exprs(STUDYID, USUBJID, ENRLFL, ENRLDT, DTHFL)
+
+ADRS_PREP <- RS %>%
+  filter(RSTESTCD %in% "DX") %>%
+  # Adjusting BLFL for subjects that have more than one flag
+  group_by(STUDYID, USUBJID, RSTESTCD) %>%
+  mutate(NUM_BLFL = sum(!is.na(RSBLFL))) %>%
+  ungroup() %>%
+  mutate(RSBLFL = case_when(
+    NUM_BLFL > 1 & VISITNUM != 1 ~ NA_character_,
+    TRUE ~ RSBLFL
+  )) %>%
+  select(-NUM_BLFL) %>%
+  mutate(
+    PARAMCD = RSTESTCD,
+    PARAM = RSTEST,
+    AVALC = RSSTRESC,
+    AVAL = get_numeric_dx_status(RSSTRESC),
+    ABLFL = RSBLFL,
+    ADT = as.Date(RSDTC),
+    ADY = RSDY,
+    COLPROT = RSGRPID
+  ) %>%
+  derive_vars_merged(
+    dataset = .,
+    dataset_add = ADSL,
+    new_vars = adsl_vars,
+    by_vars = exprs(STUDYID, USUBJID)
+  ) %>%
+  mutate(
+    AVISIT = case_when(
+      ADT <= ENRLDT & !is.na(ABLFL) ~ "BASELINE",
+      TRUE ~ VISIT
+    ),
+    AVISITN = case_when(
+      ADT <= ENRLDT & !is.na(ABLFL) ~ 0,
+      TRUE ~ ADY
+    )
+  ) %>%
+  derive_var_base(
+    dataset = .,
+    by_vars = exprs(STUDYID, USUBJID, PARAMCD),
+    source_var = AVALC
+  ) %>%
+  select(
+    STUDYID, USUBJID, RSSEQ, COLPROT, PARAMCD, PARAM, AVISIT, AVISITN,
+    AVALC, AVAL, ABLFL, BASE, ADT, ADY, VISITNUM, VISIT, EPOCH, ENRLFL, DTHFL
+  )
+
+## ----adrs-flags---------------------------------------------------------------
+# Flag subjects that have baseline diagnostics summary and
+## populate the flag per subject's records
+ADRS_PREP <- ADRS_PREP %>%
+  call_derivation(
+    dataset = .,
+    dataset_add = .,
+    derivation = derive_vars_merged,
+    variable_params = list(
+      params(
+        filter_add = ABLFL == "Y",
+        new_vars = exprs(BLBFL = ABLFL)
+      )
+    ),
+    by_vars = exprs(STUDYID, USUBJID),
+    check_type = "error",
+    relationship = "many-to-one"
+  )
+
+# Derive death parameter ----
+DAETH_PARAM <- ADSL %>%
+  select(!!!adsl_vars, DTHDT) %>%
+  # Since month imputations was performed,
+  # floor the date to the last date of a year
+  mutate(
+    DTHDT = ceiling_date(DTHDT, unit = "year") - days(1),
+    DHDY = as.numeric(DTHDT - ENRLDT),
+    DHDY = ifelse(DHDY == 0, 1, DHDY)
+  ) %>%
+  derive_var_merged_ef_msrc(
+    dataset = .,
+    by_vars = exprs(STUDYID, USUBJID),
+    flag_events = list(
+      flag_event(dataset_name = "ADRS_PREP", condition = BLBFL == "Y")
+    ),
+    source_datasets = list(ADRS_PREP = ADRS_PREP),
+    new_var = BLBFL,
+    true_value = "Y",
+  )
+
+# Add DEATH parameter ----
+ADRS_PREP <- ADRS_PREP %>%
+  # Add DEATH parameter
+  derive_extreme_records(
+    dataset = .,
+    dataset_add = DAETH_PARAM,
+    dataset_ref = DAETH_PARAM,
+    by_vars = exprs(STUDYID, USUBJID),
+    filter_add = !is.na(DTHDT),
+    check_type = "error",
+    exist_flag = AVALC,
+    true_value = "DEATH",
+    false_value = NA_character_,
+    set_values_to = exprs(
+      PARAMCD = "DEATH",
+      PARAM = "Death",
+      AVAL = ifelse(!is.na(DTHDT), 4, NA_real_),
+      ADT = DTHDT,
+      ADY = DHDY,
+      AVISITN = DHDY
+    )
+  ) %>%
+  select(-DTHDT, -DHDY) %>%
+  # Remove missing DEATH param
+  filter(!(PARAMCD %in% "DEATH" & is.na(DTHFL))) %>%
+  mutate(PARAMN = case_when(
+    PARAMCD == "DX" ~ 1,
+    PARAMCD == "DEATH" ~ 2
+  ))
+
+# Flag subjects that have at least one follow-up diagnostics summary after baseline visit
+#  Or had death records
+ADRS_PREP <- ADRS_PREP %>%
+  derive_var_merged_exist_flag(
+    dataset = .,
+    dataset_add = .,
+    by_vars = exprs(STUDYID, USUBJID),
+    filter_add = !ABLFL %in% "Y" & !is.na(AVALC) & (!EPOCH %in% "Screening" | AVISITN < 0),
+    condition = BLBFL %in% "Y" | is.na(BLBFL),
+    new_var = FOLLOWPFL,
+    false_value = "N",
+    missing_value = "M"
+  )
+
+# Identify records that will be used for the analysis: -----
+# Enrolled subjects (ENRLFL: "Y"),
+# Have a baseline diagnostics summary (BLBFL: "Y"), and
+# have at least one followup diagnostics summary/death records (FOLLOWPFL: "Y")
+ADRS_PREP <- ADRS_PREP %>%
+  mutate(
+    ANL01FL = case_when(
+      ENRLFL == "Y" & BLBFL == "Y" & FOLLOWPFL == "Y" & !EPOCH %in% "Screening" ~ "Y",
+      ENRLFL == "Y" & BLBFL == "Y" & FOLLOWPFL == "Y" & EPOCH %in% "Screening" & ABLFL %in% "Y" ~ "Y"
+    )
+  ) %>%
+  select(-ENRLFL, -ENRLDT, -DTHFL)
+
+## ----generate-adrs------------------------------------------------------------
+ADRS <- ADRS_PREP %>%
+  # Merge ADSL ADSL dataset
+  derive_vars_merged(
+    dataset = .,
+    dataset_add = single_build_from_derived(
+      metacore = adrs_metacore,
+      dataset_name = "ADRS",
+      ds_list = list("ADSL" = ADSL),
+      predecessor_only = TRUE,
+      keep = "ALL"
+    ),
+    by_vars = exprs(STUDYID, USUBJID),
+    check_type = "error",
+    relationship = "many-to-one"
+  ) %>%
+  drop_unspec_vars(
+    dataset = .,
+    metacore = adrs_metacore
+  ) %>%
+  metatools::set_variable_labels(
+    data = .,
+    metacore = adrs_metacore
+  )
+
+## ----check-adrs---------------------------------------------------------------
+ADRS <- ADRS %>%
+  check_variables(
+    data = .,
+    metacore = adrs_metacore
+  ) %>%
+  check_ct_data(
+    data = .,
+    metacore = adrs_metacore,
+    na_acceptable = TRUE,
+    omit_vars = c("ENRLFL", "ABLFL", "PARAMCD")
+  ) %>%
+  order_cols(
+    data = .,
+    metacore = adrs_metacore
+  ) %>%
+  sort_by_key(
+    data = .,
+    metacore = adrs_metacore
+  ) %>%
+  xportr_metadata(
+    .df = .,
+    metadata = adrs_metacore,
+    verbose = "stop"
+  ) %>%
+  # xportr_type() %>%
+  xportr_length() %>%
+  xportr_label()
+

@@ -1,0 +1,240 @@
+params <-
+list(INCLUDE_PACC = TRUE)
+
+## ----setup, include = FALSE---------------------------------------------------
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  warning = FALSE,
+  message = FALSE,
+  echo = TRUE,
+  fig.width = 8,
+  fig.height = 4,
+  class.source = "fold-hide",
+  result = "asis"
+)
+
+## ----setup-libraries, class.source = 'fold-show'------------------------------
+library(tidyverse)
+library(gtsummary)
+library(labelled)
+library(ggplot2)
+library(see)
+library(ADNIMERGE2)
+
+## ----params-check, include = FALSE, echo = FALSE------------------------------
+check_object_type(params$INCLUDE_PACC, "logical")
+
+## ----global-param-------------------------------------------------------------
+# tbl_summary theme
+theme_gtsummary_compact()
+# ggplot2 theme
+theme_set(theme_bw(base_size = 12))
+
+## ----abbrev-------------------------------------------------------------------
+# Abbreviation list
+abbrev_list <- paste0(
+  paste0(
+    "CN: Cognitive Normal; MCI: Mild Cognitive Impairment; DEM: Dementia; "
+  ),
+  paste0(
+    "SD: Standard Deviation; Q1: the 25th percentile; Q3: the 75th percentile; "
+  ),
+  paste0(
+    "Baseline mPACCdigit score was based on subjects that were ",
+    "enrolled only in ADNI1 study phase. "
+  ),
+  collapse = "\n "
+)
+conts_statistic_label <- c("Mean (SD)", "Median (Q1, Q3)", "Range")
+
+## ----enrollment-plot, fig.alt = "Enrollment overtime by study phase"----------
+enroll_summary_data <- ADSL %>%
+  filter(ENRLFL %in% "Y") %>%
+  mutate(ENRLDT = floor_date(ENRLDT, unit = "month")) %>%
+  group_by(ENRLDT, ORIGPROT) %>%
+  summarise(num_enroll = n()) %>%
+  ungroup() %>%
+  mutate(ORIGPROT = factor(ORIGPROT, levels = adni_phase())) %>%
+  arrange(ENRLDT, ORIGPROT) %>%
+  mutate(cum_num_enroll = cumsum(num_enroll))
+
+enroll_summary_plot <- enroll_summary_data %>%
+  ggplot(aes(x = ENRLDT, y = cum_num_enroll, color = ORIGPROT)) +
+  geom_line() +
+  scale_x_date(
+    date_minor_breaks = "2 years",
+    limits = range(enroll_summary_data$ENRLDT)
+  ) +
+  labs(
+    x = "Timeline Calendar",
+    y = "Cumulative Enrollment Per Month",
+    color = "ADNI Study Phase"
+  ) +
+  theme(axis.text.x = element_text(hjust = 0.3, vjust = 0, angle = 15))
+enroll_summary_plot
+
+## ----overall-summary----------------------------------------------------------
+# Characteristics/variables
+include_vars <- c(
+  "AGE", "SEX", "EDUC", "RACE", "ETHNIC", "MARISTAT",
+  "DX", "APOE", "ADASTT13", "CDGLOBAL", "CDRSB", "MMSCORE",
+  "FAQTOTAL"
+)
+if (params$INCLUDE_PACC) {
+  pacc_vars <- c("MPACCTRAILSB", "MPACCDIGIT")
+  include_vars <- c(include_vars, pacc_vars)
+}
+
+tbl_summary(
+  data = ADSL %>%
+    filter(ENRLFL %in% "Y"),
+  by = ORIGPROT,
+  include = include_vars,
+  type = all_continuous() ~ "continuous2",
+  statistic = list(
+    all_continuous() ~ c(
+      "{mean} ({sd})",
+      "{median} ({p25}, {p75})",
+      "{min}, {max}"
+    ),
+    all_categorical() ~ "{n} ({p}%)"
+  ),
+  digits = all_continuous() ~ 1,
+  percent = "column",
+  missing_text = "(Missing)"
+) %>%
+  add_overall(last = TRUE) %>%
+  add_stat_label(label = all_continuous2() ~ conts_statistic_label) %>%
+  modify_footnote_header(
+    footnote = "Column-wise percentage; n (%)",
+    columns = all_stat_cols(),
+    replace = TRUE
+  ) %>%
+  modify_abbreviation(abbreviation = abbrev_list) %>%
+  modify_caption(
+    caption = "Table 1. ADNI - Subject Characteristics: By Study Phase"
+  ) %>%
+  bold_labels()
+
+## ----viloin-plot, fig.height = 11, fig.alt = "Distribution of numeric characteristics: Overall"----
+var_label_list <- get_variable_labels(ADSL)
+cont_var_list <- c(
+  "AGE", "EDUC", "ADASTT13", "CDGLOBAL",
+  "CDRSB", "MMSCORE", "FAQTOTAL"
+)
+if (params$INCLUDE_PACC) {
+  cont_var_list <- c(cont_var_list, pacc_vars)
+}
+cont_bl_violin_plot <- lapply(cont_var_list, function(x) {
+  graph_data <- ADSL %>%
+    filter(ENRLFL %in% "Y") %>%
+    rename_with(~ paste0("yvalue"), all_of(x))
+
+  graph_data %>%
+    ggplot(data = ., aes(x = yvalue)) +
+    geom_histogram() +
+    labs(
+      x = var_label_list[[x]],
+      y = "Count",
+      title = paste0("n = ", sum(!is.na(graph_data$yvalue)))
+    ) +
+    theme(title = element_text(size = 11))
+})
+
+names(cont_bl_violin_plot) <- cont_var_list
+
+plots(
+  cont_bl_violin_plot,
+  n_columns = 2,
+  caption = ifelse(params$INCLUDE_PACC, paste0(
+    "Baseline mPACCdigit score was based on subjects that were enrolled only ",
+    "in ADNI1 study phase. \n The remaining summary plots were based on ",
+    "subjects that enrolled in ADNI study."
+  ), ""),
+  title = "ADNI - Plots of Numeric Characteristics: By Study Phase"
+)
+
+## ----bl-demog-summary-bldx----------------------------------------------------
+tbl_summary(
+  data = ADSL %>%
+    filter(ENRLFL %in% "Y"),
+  by = DX,
+  include = include_vars,
+  type = all_continuous() ~ "continuous2",
+  statistic = list(
+    all_continuous() ~ c(
+      "{mean} ({sd})",
+      "{median} ({p25}, {p75})",
+      "{min}, {max}"
+    ),
+    all_categorical() ~ "{n} ({p}%)"
+  ),
+  digits = all_continuous() ~ 1,
+  percent = "row",
+  missing_text = "(Missing)"
+) %>%
+  add_stat_label(label = all_continuous2() ~ conts_statistic_label) %>%
+  modify_caption(caption = paste0(
+    "Table 2. ADNI - Subject Characteristics: ",
+    "By Baseline Diagnosis Status"
+  )) %>%
+  modify_footnote_header(
+    footnote = "Row-wise percentage; n (%)",
+    columns = all_stat_cols(),
+    replace = TRUE
+  ) %>%
+  modify_abbreviation(abbreviation = abbrev_list) %>%
+  bold_labels()
+
+## ----viloin-plot-bl-dx, fig.height = 13, fig.width = 8, fig.alt = "Distribution of numeric characteristics: By baseline diagnostics status"----
+dx_color_pal <- c("#73C186", "#F2B974", "#DF957C", "#999999")
+
+# Create density plot
+cont_violin_plot_bl_dx <- lapply(cont_var_list, function(x) {
+  graph_data <- ADSL %>%
+    filter(ENRLFL %in% "Y") %>%
+    filter(!is.na(DX)) %>%
+    rename_with(~ paste0("yvalue"), all_of(x))
+
+  n_obs <- graph_data %>%
+    select(yvalue, DX) %>%
+    na.omit() %>%
+    nrow()
+
+  graph_data %>%
+    ggplot(data = ., aes(x = yvalue, fill = DX)) +
+    geom_density(alpha = 0.5) +
+    labs(
+      x = paste0(var_label_list[[x]]),
+      y = "Density",
+      color = get_variable_labels(ADSL$DX),
+      title = var_label_list[[x]],
+      subtitle = paste0(" By ", get_variable_labels(ADSL$DX), ", n = ", n_obs),
+      fill = get_variable_labels(ADSL$DX)
+    ) +
+    scale_fill_manual(values = dx_color_pal) +
+    theme(
+      legend.position = "bottom",
+      title = element_text(size = 10.5)
+    )
+})
+
+names(cont_violin_plot_bl_dx) <- cont_var_list
+
+plots(
+  cont_violin_plot_bl_dx,
+  n_columns = 2,
+  guides = "collect",
+  caption = paste0(
+    "Based on subjects that had known diagnostics status at baseline visit. \n",
+    "Baseline mPACCdigit score was based on subjects that were enrolled only ",
+    "in ADNI1 study phase. \n The remaining summary plots were based on ",
+    "subjects that enrolled in ADNI study."
+  ),
+  title = paste0(
+    "ADNI - Plots of Numeric Characteristics: ",
+    "By Baseline Diagnostics Status"
+  )
+) & theme(legend.position = "bottom")
+

@@ -1,0 +1,3105 @@
+params <-
+list(INCLUDE_PACC = TRUE)
+
+## ----setup, include = FALSE---------------------------------------------------
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  warning = FALSE,
+  message = FALSE,
+  class.source = "fold-show"
+)
+# Data print function
+datatable <- function(data, paging = FALSE, searchable = TRUE, bInfo = FALSE, ...) {
+  DT::datatable(
+    data = data, ...,
+    options = list(paging = paging, searchable = searchable, bInfo = bInfo, ...)
+  )
+}
+
+## ----setup-libraries----------------------------------------------------------
+library(tidyverse)
+library(assertr)
+library(labelled)
+library(DT)
+library(measurements)
+library(sdtm.oak)
+
+## ----params-check, include = FALSE, echo = FALSE------------------------------
+check_object_type(params$INCLUDE_PACC, "logical")
+
+## ----phase-visit-epoch, class.source = NULL, echo = FALSE---------------------
+# Create study epoch stage- overall and phase-specific
+EPOCH_LIST <- VISITS %>%
+  filter(!VISCODE %in% c("reg", "AUT", "4_disp")) %>%
+  mutate(EPOCH = case_when(
+    VISCODE %in% c("sc", "4_sc", "scmri", "f", "v01", "v02") ~ "Screening",
+    VISCODE %in% c("bl", "4_bl", "init", "4_init", "v03", "v06") ~ "Baseline",
+    VISCODE %in% c("reg", "f") ~ NA_character_,
+    TRUE ~ "Follow-up" # Includes uns1, tau and nv visits
+  )) %>%
+  mutate(PHASE_EPOCH = paste0(PHASE, " - ", EPOCH)) %>%
+  select(PHASE, VISCODE, PHASE_EPOCH, EPOCH, VISORDER, VISNAME) %>%
+  group_by(PHASE) %>%
+  arrange(VISORDER) %>%
+  mutate(PHASE_VISITNUM = row_number() - 2) %>%
+  ungroup() %>%
+  # Create phase-specific visit number/order
+  # 999 - represents unscheduled visit
+  mutate(PHASE_VISITNUM = case_when(
+    VISCODE %in% c("nv", "uns1", "tau") ~ 999,
+    PHASE %in% "ADNI1" & VISCODE %in% c("f", "sc") ~ -1,
+    PHASE %in% "ADNI1" & VISCODE %in% "bl" ~ 1,
+    PHASE %in% "ADNI1" & str_detect(VISCODE, "m") ~ PHASE_VISITNUM + 1,
+    PHASE %in% "ADNIGO" & VISCODE %in% c("sc", "scmri") ~ PHASE_VISITNUM - 1,
+    PHASE %in% "ADNI2" & VISCODE %in% c("v01", "v02") ~ PHASE_VISITNUM - 1,
+    PHASE %in% "ADNI2" & VISCODE %in% c("v03", "v06") ~ 1,
+    PHASE %in% "ADNI2" & VISCODE %in% c("v04", "v07") ~ 2,
+    PHASE %in% "ADNI2" & VISCODE %in% "v05" ~ 3,
+    PHASE %in% "ADNI2" & !VISCODE %in% str_c("v0", 1:7) ~ PHASE_VISITNUM - 2,
+    PHASE %in% c("ADNI3", "ADNI4") & VISCODE %in% c("sc", "4_sc") ~ -1,
+    PHASE %in% c("ADNI3", "ADNI4") & VISCODE %in% c("bl", "4_bl") ~ 1,
+    TRUE ~ PHASE_VISITNUM
+  )) %>%
+  mutate(PTTYPE = case_when(
+    PHASE %in% c("ADNI1", "ADNIGO") ~ "Both",
+    str_detect(VISNAME, "Continuing ") == TRUE ~ "Rollover",
+    str_detect(VISNAME, "New Pt|Screening") == TRUE ~ "New",
+    TRUE ~ "Both"
+  )) %>%
+  arrange(PHASE, PHASE_VISITNUM) %>%
+  mutate(VISIT = case_when(
+    !str_detect(VISNAME, paste0(adni_phase(), collapse = "|")) ~ paste0(PHASE, " ", VISNAME),
+    TRUE ~ VISNAME
+  )) %>%
+  assert_non_missing(-VISORDER)
+
+# Separate by participant type
+EPOCH_LIST_LONG <- EPOCH_LIST %>%
+  filter(PTTYPE %in% c("New", "Both")) %>%
+  mutate(PTTYPE = "New") %>%
+  bind_rows(
+    EPOCH_LIST %>%
+      filter(PTTYPE %in% c("Rollover", "Both")) %>%
+      mutate(PTTYPE = "Rollover") %>%
+      # Adjust EPOCH for rollovers
+      mutate(EPOCH = case_when(
+        EPOCH %in% c("Baseline", "Screening") &
+          PHASE %in% c(adni_phase()[-1]) ~ "Follow-up",
+        TRUE ~ EPOCH
+      ))
+  )
+
+## ----include-origprot-colprot, class.source = NULL, echo = TRUE---------------
+# Add study track (i.e., New or Rollover)
+REGISTRY <- REGISTRY %>%
+  mutate(PTTYPE = adni_study_track(COLPROT, ORIGPROT))
+
+ROSTER <- ROSTER %>%
+  mutate(PTTYPE = adni_study_track(COLPROT, ORIGPROT))
+
+## ----study-visit-flows, class.source = NULL, echo = FALSE---------------------
+# Unique participant IDs
+unique_rid <- unique(c(ROSTER$RID, REGISTRY$RID, PTDEMOG$RID))
+
+# Generate VISITNUM and VISITDY
+PHASE_VISIT_RECORD <- tibble(RID = unique_rid) %>%
+  # Add ORIGPOL
+  mutate(ORIGPROT = original_study_protocol(RID)) %>%
+  # Last known study phases based ROSTER/REGISTRY data
+  left_join(
+    ROSTER %>%
+      # Add study phase order number
+      mutate(PHASE_NUM = adni_phase_order_num(COLPROT)) %>%
+      assert_non_missing(PHASE_NUM) %>%
+      distinct(RID, COLPROT, PHASE_NUM) %>%
+      group_by(RID) %>%
+      filter(PHASE_NUM == max(PHASE_NUM)) %>%
+      ungroup() %>%
+      assert_uniq(RID) %>%
+      select(RID, LASTPROT = COLPROT, LAST_PHASE_NUM = PHASE_NUM),
+    by = "RID"
+  ) %>%
+  assert_uniq(RID) %>%
+  assert_non_missing(LASTPROT) %>%
+  mutate(FIRST_PHASE_NUM = adni_phase_order_num(ORIGPROT)) %>%
+  # Get possible study phases between the `FIRST` and `LAST` known study phase
+  expand_grid(PHASE_NUM_INTERVAL = adni_phase_order_num(adni_phase())) %>%
+  assert_non_missing(PHASE_NUM_INTERVAL) %>%
+  # Possible study participation period
+  filter(PHASE_NUM_INTERVAL <= LAST_PHASE_NUM & PHASE_NUM_INTERVAL >= FIRST_PHASE_NUM) %>%
+  group_by(RID) %>%
+  mutate(MAX_PHASE = n()) %>%
+  ungroup() %>%
+  filter(MAX_PHASE <= LAST_PHASE_NUM) %>%
+  # Convert PHASE_NUM_INTERVAL to ADNI phase name
+  mutate(COLPROT = convert_adni_phase_order_num(PHASE_NUM_INTERVAL)) %>%
+  # Add study track
+  mutate(PTTYPE = adni_study_track(COLPROT, ORIGPROT)) %>%
+  # filter(RID %in% 1412) %>%
+  # Add phase-specific visit code and order
+  left_join(
+    EPOCH_LIST_LONG %>%
+      filter(PTTYPE %in% c("New", "Rollover")) %>%
+      select(COLPROT = PHASE, VISCODE, PHASE_VISITNUM, VISIT, PTTYPE, EPOCH),
+    relationship = "many-to-many",
+    by = c("COLPROT", "PTTYPE")
+  ) %>%
+  assert_uniq(RID, COLPROT, VISCODE)
+
+PHASE_VISIT_RECORD <- PHASE_VISIT_RECORD %>%
+  left_join(
+    REGISTRY %>%
+      select(RID, ORIGPROT, COLPROT, VISCODE, EXAMDATE) %>%
+      mutate(REGISTRY_RECORD = "Yes"),
+    by = c("RID", "COLPROT", "ORIGPROT", "VISCODE")
+  ) %>%
+  verify(nrow(.) == nrow(PHASE_VISIT_RECORD))
+
+# Overall VISITNUM (Planned Visits)
+ADNI_VISIT_RECORD <- PHASE_VISIT_RECORD %>%
+  filter(!c(PHASE_VISITNUM == 999 | VISCODE == "f")) %>%
+  mutate(COLPROT = factor(COLPROT, levels = adni_phase())) %>%
+  arrange(RID, COLPROT) %>%
+  # Adjusting for rollover screening visits in ADNIGO
+  mutate(PHASE_VISITNUM = case_when(
+    PTTYPE %in% "Rollover" & COLPROT %in% "ADNIGO" ~ PHASE_VISITNUM + 2,
+    TRUE ~ PHASE_VISITNUM
+  )) %>%
+  group_by(RID, COLPROT) %>%
+  mutate(NUM_RECORDS_PHASE = n()) %>%
+  nest(data = everything() & !c(RID, COLPROT, NUM_RECORDS_PHASE)) %>%
+  ungroup() %>%
+  group_by(RID) %>%
+  mutate(CUM_NUM_RECORDS_PHASE = cumsum(NUM_RECORDS_PHASE)) %>%
+  mutate(LAG_NUM_RECORDS_PHASE = lag(CUM_NUM_RECORDS_PHASE, n = 1L)) %>%
+  ungroup() %>%
+  # Adjusting screening for rollovers
+  mutate(data = map2(
+    .x = data,
+    .y = LAG_NUM_RECORDS_PHASE,
+    ~ mutate(.x,
+      VISITNUM = case_when(
+        is.na(.y) ~ PHASE_VISITNUM,
+        !is.na(.y) ~ PHASE_VISITNUM + .y
+      )
+    )
+  )) %>%
+  unnest(cols = data)
+
+# This mapping may overestimate the planned
+#  VISITNUM for rollovers due to the study design
+ADNI_VISIT_RECORD <- bind_rows(
+  ADNI_VISIT_RECORD,
+  PHASE_VISIT_RECORD %>%
+    filter((PHASE_VISITNUM == 999 | VISCODE == "f")) %>%
+    mutate(VISITNUM = PHASE_VISITNUM)
+) %>%
+  select(
+    RID, ORIGPROT, COLPROT, LASTPROT, PTTYPE,
+    VISCODE, VISIT, VISITNUM, EPOCH
+  )
+
+ADNI_VISIT_RECORD <- ADNI_VISIT_RECORD %>%
+  # Add VISITDATE and VISTATUS
+  left_join(
+    REGISTRY %>%
+      mutate(
+        VISTAT = case_when(
+          RGCONDCT %in% "No" | VISTYPE %in% "Not done" ~ "NOT DONE"
+        ),
+        VISDTC = create_iso8601(as.character(EXAMDATE), .format = "y-m-d")
+      ) %>%
+      select(RID, ORIGPROT, COLPROT, VISCODE, VISDTC, VISTAT) %>%
+      distinct(),
+    by = c("RID", "ORIGPROT", "COLPROT", "VISCODE")
+  ) %>%
+  verify(nrow(.) == nrow(ADNI_VISIT_RECORD))
+
+## ----dm-data-dic, echo = FALSE------------------------------------------------
+dm_data_dic <- bind_rows(
+  c(
+    FLDNAME = "STUDYID",
+    LABEL = "Study Identifier"
+  ),
+  c(
+    FLDNAME = "DOMAIN",
+    LABEL = "Domain Abbreviation"
+  ),
+  c(
+    FLDNAME = "USUBJID",
+    LABEL = "Unique Subject Identifier"
+  ),
+  c(
+    FLDNAME = "SUBJID",
+    LABEL = "Subject Identifier for the Study"
+  ),
+  c(
+    FLDNAME = "ORIGPROT",
+    LABEL = "Original study protocol",
+    TEXT = "First time participation in ADNI study phase"
+  ),
+  c(
+    FLDNAME = "SESTDTC",
+    LABEL = "Screening Start Date/Time",
+    TEXT = "First screening start date/time"
+  ),
+  c(
+    FLDNAME = "RFSTDTC",
+    LABEL = "Subject Enrolled Date/Time *"
+  ),
+  # c(FLDNAME = "RFENDTC", LABEL = "Subject Reference End Date/Time"),
+  # c(FLDNAME = "RFICDTC", LABEL = "Date/Time of Informed Consent"),
+  c(
+    FLDNAME = "RFPENDTC",
+    LABEL = "Date/Time of End of Participation*",
+    TEXT = paste0(
+      "Last known date/time when participant ended thier participation or",
+      " follow-up in ADNI study. As character format for unknown MM-DD values."
+    )
+  ),
+  c(
+    FLDNAME = "DTHDTC",
+    LABEL = "Date/Time of Death"
+  ),
+  c(
+    FLDNAME = "DTHFL",
+    LABEL = "Subject Death Flag"
+  ),
+  c(
+    FLDNAME = "SITEID",
+    LABEL = "Study Site Identifier"
+  ),
+  c(
+    FLDNAME = "AGE",
+    LABEL = "Age",
+    TEXT = "Age at first screening visit (in years)"
+  ),
+  c(
+    FLDNAME = "AGEU",
+    LABEL = "Age Units"
+  ),
+  c(
+    FLDNAME = "SEX",
+    LABEL = "Sex at Birth"
+  ),
+  c(
+    FLDNAME = "RACE",
+    LABEL = "Race"
+  ),
+  c(
+    FLDNAME = "ETHNIC",
+    LABEL = "Ethnicity"
+  ),
+  # These fields are included to illustrate the PHARMAVERSE approach
+  c(
+    FLDNAME = "ARMCD",
+    LABEL = "Planned Arm Code"
+  ),
+  c(
+    FLDNAME = "ARM",
+    LABEL = "Description of Planned Arm"
+  ),
+  c(
+    FLDNAME = "ACTARMCD",
+    LABEL = "Actual Arm Code"
+  ),
+  c(
+    FLDNAME = "ACTARM",
+    LABEL = "Actual Treatment Description"
+  ),
+  c(
+    FLDNAME = "ARMNRS",
+    LABEL = "Reason Arm and/or Actual Arm is Null",
+    TEXT = "Non-Interventional Study"
+  ),
+  # Missing variables
+  c(
+    FLDNAME = "COUNTRY",
+    LABEL = "Country",
+    TEXT = "Country of the investigational site located"
+  ),
+  c(
+    FLDNAME = "DMDTC",
+    LABEL = "Date/Time of Collection"
+  ),
+  c(
+    FLDNAME = "DMDY",
+    LABEL = "Study Day of Collection"
+  )
+) %>%
+  tibble::as_tibble() %>%
+  relocate(c(FLDNAME, LABEL, TEXT)) %>%
+  mutate(
+    TEXT = replace_na(TEXT, " "),
+    DERIVED = TRUE,
+    TBLNAME = "DM",
+    CRFNAME = "[ Derived ] Demographic Characteristics"
+  )
+
+## ----dm-data-dic-print, echo = FALSE------------------------------------------
+dm_data_dic %>%
+  select(FLDNAME, LABEL, TEXT) %>%
+  datatable(., paging = TRUE)
+
+## ----generate-dm0-------------------------------------------------------------
+# Join columns
+dm_join_var <- c("RID", "ORIGPROT")
+
+# Demographic data columns
+dm_cols <- c("PTGENDER", "PTRACCAT", "PTETHCAT", "PTDOB")
+names(dm_cols) <- c("SEX", "RACE", "ETHNIC", "BRTHDTC")
+
+DM <- tibble(RID = unique_rid) %>%
+  mutate(ORIGPROT = original_study_protocol(RID = RID)) %>%
+  # Add PTDEMOG record
+  left_join(
+    PTDEMOG %>%
+      assert_non_missing(ORIGPROT, COLPROT) %>%
+      filter(ORIGPROT == COLPROT) %>%
+      group_by(RID) %>%
+      filter(
+        (any(!is.na(VISDATE)) & VISDATE == min(VISDATE, na.rm = TRUE)) |
+          (all(is.na(VISDATE)) & row_number() == 1)
+      ) %>%
+      ungroup() %>%
+      assert_uniq(RID) %>%
+      select(RID, ORIGPROT, VISDATE, all_of(as.character(dm_cols))),
+    by = dm_join_var
+  ) %>%
+  rename(all_of(dm_cols)) %>%
+  generate_oak_id_vars_adni(raw_src = "PTDEMOG")
+
+## ----generate-dm1-------------------------------------------------------------
+DM <- DM %>%
+  # Add screening visit date
+  left_join(
+    get_adni_screen_date(
+      .registry = REGISTRY,
+      phase = "Overall",
+      multiple_screen_visit = FALSE
+    ) %>%
+      select(RID, ORIGPROT, SESTDTC = SCREENDATE) %>%
+      assert(is_uniq, RID),
+    by = dm_join_var
+  ) %>%
+  # Add enrollment/RFSTDTC date
+  create_rfstdtc(.registry = REGISTRY) %>%
+  # Compute age based on first screening date
+  mutate(
+    AGE = round(as.numeric(SESTDTC - my(BRTHDTC)) / 365.25, 1),
+    AGEU = "Years",
+    SUBJID = as.character(RID),
+    ARMCD = NA_character_,
+    ACTARM = NA_character_,
+    ARM = NA_character_,
+    ACTARMCD = NA_character_,
+    ACTARM = NA_character_,
+    ARMNRS = "Non-Interventional Study",
+    COUNTRY = NA_character_,
+    DMDTC = create_iso8601(as.character(VISDATE), .format = "y-m-d")
+  )
+
+## ----generate-dm2-------------------------------------------------------------
+# Add death flag
+DM <- DM %>%
+  left_join(
+    get_death_flag(
+      .studysum = STUDYSUM,
+      .adverse = ADVERSE,
+      .recadv = RECADV
+    ) %>%
+      verify(all(DTHFL == "Yes")) %>%
+      select(RID, ORIGPROT, DTHFL, DTHDTC),
+    by = dm_join_var
+  )
+
+## ----generate-dm3-------------------------------------------------------------
+# Add last known disposition date
+DM <- DM %>%
+  left_join(
+    get_disposition_flag(
+      .registry = REGISTRY,
+      .studysum = STUDYSUM
+    ) %>%
+      mutate(COLPROT = factor(COLPROT, levels = adni_phase())) %>%
+      group_by(RID) %>%
+      arrange(COLPROT) %>%
+      # Last known discontinuation/disposition date
+      filter(row_number() == n()) %>%
+      ungroup() %>%
+      select(RID, ORIGPROT, SDSTATUS, RFPENDTC = SDDATE),
+    by = dm_join_var
+  ) %>%
+  mutate(RFPENDTC = case_when(
+    !is.na(DTHDTC) & is.na(RFPENDTC) ~ as.character(DTHDTC),
+    TRUE ~ as.character(RFPENDTC)
+  ))
+
+## ----generate-dm4-------------------------------------------------------------
+DM <- DM %>%
+  # Derive USUBJID and SITIED
+  derive_usubjid(
+    .data = .,
+    .registry = REGISTRY,
+    .roster = ROSTER,
+    .ptdemog = PTDEMOG,
+    varList = c("USUBJID", "SITEID")
+  ) %>%
+  derive_study_day_adni(
+    sdtm_in = .,
+    domain = "DM",
+    dm_domain = .,
+    refdt = "RFSTDTC"
+  ) %>%
+  assign_studyid_domain(
+    studyid = "ADNI",
+    domain = "DM"
+  ) %>%
+  assign_vars_label(
+    .data = .,
+    data_dict = dm_data_dic,
+    .strict = TRUE
+  ) %>%
+  assert_non_missing(SITEID, USUBJID, SUBJID)
+
+## ----sc-data-dic, echo = FALSE------------------------------------------------
+sc_data_dic <- bind_rows(
+  c(
+    FLDNAME = "STUDYID",
+    LABEL = "Study Identifier",
+    TEXT = ""
+  ),
+  c(
+    FLDNAME = "DOMAIN",
+    LABEL = "Domain Abbrevation"
+  ),
+  c(
+    FLDNAME = "USUBJID",
+    LABEL = "Unique Subject Identifier"
+  ),
+  c(
+    FLDNAME = "SCSEQ",
+    LABEL = "Sequence Number"
+  ),
+  c(
+    FLDNAME = "SCGRPID",
+    LABEL = "Group ID",
+    TEXT = "Study Protocol of Data Collection"
+  ),
+  c(
+    FLDNAME = "SCTESTCD",
+    LABEL = "Subject Characteristic Short Name"
+  ),
+  c(
+    FLDNAME = "SCTEST",
+    LABEL = "Subject Characteristic"
+  ),
+  c(
+    FLDNAME = "SCCAT",
+    LABEL = "Category for Subject Characteristic"
+  ),
+  c(
+    FLDNAME = "SCORRES",
+    LABEL = "Result or Finding in Original Units"
+  ),
+  c(
+    FLDNAME = "SCSTRESN",
+    LABEL = "Numeric Result/Finding in Standard Units"
+  ),
+  c(
+    FLDNAME = "SCBLFL",
+    LABEL = "Baseline Flag"
+  ),
+  c(
+    FLDNAME = "VISITNUM",
+    LABEL = "Visit Number"
+  ),
+  c(
+    FLDNAME = "VISIT",
+    LABEL = "Visit Name"
+  ),
+  # c(
+  #   FLDNAME = "VISITDY",
+  #   LABEL = "(Planned*) Study Day of Visit"
+  # ),
+  c(
+    FLDNAME = "EPOCH",
+    LABEL = "Epoch"
+  ),
+  c(
+    FLDNAME = "SCDTC",
+    LABEL = "Date/Time of Collection"
+  ),
+  c(
+    FLDNAME = "SCDY",
+    LABEL = "Study Day of Collection"
+  )
+) %>%
+  tibble::as_tibble() %>%
+  relocate(c(FLDNAME, LABEL, TEXT)) %>%
+  mutate(TEXT = replace_na(TEXT, " ")) %>%
+  mutate(
+    DERIVED = TRUE,
+    TBLNAME = "SC",
+    CRFNAME = "[ Derived ] Subject Characteristics"
+  )
+
+## ----sc-data-dic-print, eval = TRUE, echo = FALSE-----------------------------
+sc_data_dic %>%
+  select(FLDNAME, LABEL) %>%
+  datatable(., paging = TRUE)
+
+## ----generate-sc0-------------------------------------------------------------
+# Full demographic records ----
+sc_common_cols <- c("ORIGPROT", "COLPROT", "RID", "VISCODE", "VISDATE")
+
+SC_PTDEMOG <- PTDEMOG %>%
+  select(-all_of(
+    c(
+      "PTID", "VISCODE2", "ID", "SITEID", "USERDATE", "USERDATE2",
+      "DD_CRF_VERSION_LABEL", "LANGUAGE_CODE", "HAS_QC_ERROR", "update_stamp"
+    )
+  )) %>%
+  mutate(COLPROT = factor(COLPROT, levels = adni_phase())) %>%
+  assert_non_missing(COLPROT) %>%
+  group_by(RID, ORIGPROT, COLPROT) %>%
+  # Since it is observational study
+  arrange(COLPROT, VISDATE) %>%
+  fill(-all_of(sc_common_cols), .direction = "down") %>%
+  fill(-all_of(sc_common_cols), .direction = "up") %>%
+  ungroup() %>%
+  mutate(across(-all_of(sc_common_cols), as.character)) %>%
+  mutate(VISCODE = factor(VISCODE, levels = c(unique(EPOCH_LIST$VISCODE)))) %>%
+  assert_non_missing(VISCODE)
+
+SC_DEMOG <- tibble(RID = unique_rid) %>%
+  mutate(ORIGPROT = original_study_protocol(RID = RID)) %>%
+  left_join(
+    SC_PTDEMOG,
+    by = dm_join_var
+  ) %>%
+  pivot_longer(
+    cols = !all_of(sc_common_cols),
+    names_to = "SCTESTCD",
+    values_to = "SCORRES"
+  ) %>%
+  # Remove missing values
+  drop_na(SCORRES) %>%
+  mutate(
+    SCCAT = "Demographic Records",
+    SCDTC = as.character(VISDATE)
+  ) %>%
+  # Required a long format dataset
+  generate_oak_id_vars_adni(raw_src = "PTDEMOG")
+
+# Area Deprivation Index (ADI) for ADNI4 phase only ----
+SC_ADI <- ADI %>%
+  verify(all(COLPROT == adni_phase()[5])) %>%
+  select(
+    RID, ORIGPROT, COLPROT, VISCODE, ADISTATE, ADINATIONAL, ADIREV,
+    SCDTC = ADIDATE
+  ) %>%
+  generate_oak_id_vars_adni(raw_src = "ADI") %>%
+  mutate(across(c(ADISTATE, ADINATIONAL, ADIREV, SCDTC), as.character)) %>%
+  pivot_longer(
+    cols = c(ADISTATE, ADINATIONAL, ADIREV),
+    names_to = "SCTESTCD",
+    values_to = "SCORRES"
+  ) %>%
+  mutate(SCCAT = "Area Deprivation Index")
+
+# RUCA and RUCC from ADNI4 phase only ----
+rurality_cols <- c("RUCA", "RUCC", "RUCA_2010", "RUCC_2023")
+SC_RURALITY <- RURALITY %>%
+  verify(all(COLPROT == adni_phase()[5])) %>%
+  select(
+    RID, ORIGPROT, COLPROT, VISCODE, all_of(rurality_cols),
+    SCDTC = RURDATE
+  ) %>%
+  generate_oak_id_vars_adni(raw_src = "RURALITY") %>%
+  mutate(across(all_of(c(rurality_cols, "SCDTC")), as.character)) %>%
+  pivot_longer(
+    cols = all_of(rurality_cols),
+    names_to = "SCTESTCD",
+    values_to = "SCORRES"
+  ) %>%
+  mutate(SCCAT = "Rurality")
+
+## ----generate-sc1-------------------------------------------------------------
+SC <- bind_rows(SC_DEMOG, SC_ADI, SC_RURALITY) %>%
+  assert_uniq(RID, ORIGPROT, COLPROT, VISCODE, SCTESTCD) %>%
+  mutate(
+    COLPROT = factor(COLPROT, levels = adni_phase()),
+    SCGRPID = COLPROT,
+    SCSTAT = case_when(is.na(SCDTC) ~ "NOT DONE"),
+    SCSTRESN = as.numeric(SCORRES),
+    SCDTC = create_iso8601(SCDTC, .format = "y-m-d")
+  ) %>%
+  assert_uniq(RID, ORIGPROT, COLPROT, VISCODE, SCTESTCD) %>%
+  derive_usubjid(varList = "USUBJID") %>%
+  assign_studyid_domain(
+    .data = .,
+    studyid = "ADNI",
+    domain = "SC"
+  ) %>%
+  assign_visit_attr(
+    .data = .,
+    visit_record_data = ADNI_VISIT_RECORD,
+    domain = "SC"
+  ) %>%
+  assign_epoch(
+    .data = .,
+    .epoch = EPOCH_LIST_LONG
+  ) %>%
+  derive_blfl_adni(
+    sdtm_in = .,
+    dm_domain = DM,
+    tgt_var = "SCBLFL"
+  ) %>%
+  derive_study_day_adni(
+    sdtm_in = .,
+    dm_domain = DM,
+    domain = "SC",
+    refdt = "RFSTDTC"
+  ) %>%
+  derive_seq(
+    tgt_var = "SCSEQ",
+    rec_vars = c("USUBJID", "SCTESTCD", "SCGRPID")
+  )
+
+## ----scrtest-detail, eval = TRUE, echo = FALSE--------------------------------
+# Field labels from data dictionary
+# Some labels might have more than 40 characters
+sc_string_pattern <- paste0(
+  "^[0-9]\\.|^[0-9]{2}\\.|^[0-9][a-z]\\.|",
+  "[0-9]{2}[a-z]\\.|Participant|Participant\\'s",
+  collapse = "|"
+)
+
+SC_TESTCD_LIST <- DATADIC %>%
+  # filter(TBLNAME %in% c("PTDEMOG", "RURALITY", "ADI")) %>%
+  filter(FLDNAME %in% SC$SCTESTCD) %>%
+  distinct(FLDNAME, TEXT) %>%
+  mutate(
+    TEXT = str_remove_all(TEXT, sc_string_pattern),
+    TEXT = trimws(TEXT)
+  ) %>%
+  select(SCTESTCD = FLDNAME, SCTEST = TEXT) %>%
+  distinct() %>%
+  group_by(SCTESTCD) %>%
+  filter(row_number() == n()) %>%
+  ungroup()
+
+## ----add-sctest---------------------------------------------------------------
+SC <- SC %>%
+  # Add characteristics test name and check coded value
+  set_dom_test(
+    .data = .,
+    .data_list = SC_TESTCD_LIST %>%
+      select(SCTESTCD, SCTEST),
+    merge_by = "SCTESTCD"
+  ) %>%
+  assert_non_missing(SCTESTCD, SCTEST) %>%
+  assign_vars_label(data_dict = sc_data_dic)
+
+## ----ae-data-dic, echo = FALSE------------------------------------------------
+ae_data_dic <- bind_rows(
+  c(
+    FLDNAME = "STUDYID",
+    LABEL = "Study Identifier"
+  ),
+  c(
+    FLDNAME = "DOMAIN",
+    LABEL = "Domain Abbreviation"
+  ),
+  c(
+    FLDNAME = "USUBJID",
+    LABEL = "Unique Subject Identifier"
+  ),
+  c(
+    FLDNAME = "AEGRPID",
+    LABEL = "Group ID",
+    TEXT = "Study Protocol of Data Collection"
+  ),
+  c(
+    FLDNAME = "AESEQ",
+    LABEL = "Sequence Number"
+  ),
+  c(
+    FLDNAME = "AETERM",
+    LABEL = "Reported Term for the Adverse Event"
+  ),
+  c(
+    FLDNAME = "AELLT",
+    LABEL = "Lowest Level Term",
+    TEXT = "Based on MeDRA Coding"
+  ),
+  c(
+    FLDNAME = "AELLTCD",
+    LABEL = "Lowest Level Term Code",
+    TEXT = "Based on MeDRA Coding"
+  ),
+  c(
+    FLDNAME = "AEDECOD",
+    LABEL = "Dictionary-Derived Term",
+    TEXT = "Based on MeDRA Coding"
+  ),
+  c(
+    FLDNAME = "AEPTCD",
+    LABEL = "Preferred Term Code",
+    TEXT = "Based on MeDRA Coding"
+  ),
+  c(
+    FLDNAME = "AEHLT",
+    LABEL = "High Level Term",
+    TEXT = "Based on MeDRA Coding"
+  ),
+  c(
+    FLDNAME = "AEHLTCD",
+    LABEL = "High Level Term Code",
+    TEXT = "Based on MeDRA Coding"
+  ),
+  c(
+    FLDNAME = "AEHLGT",
+    LABEL = "High Level Group Term",
+    TEXT = "Based on MeDRA Coding"
+  ),
+  c(
+    FLDNAME = "AEHLGTCD",
+    LABEL = "High Level Group Term Code",
+    TEXT = "Based on MeDRA Coding"
+  ),
+  c(
+    FLDNAME = "AESOC",
+    LABEL = "Primary Sytem Organ Class",
+    TEXT = "Based on MeDRA Coding"
+  ),
+  c(
+    FLDNAME = "AESOCCD",
+    LABEL = "Primary Sytem Organ Class Code",
+    TEXT = "Based on MeDRA Coding"
+  ),
+  c(
+    FLDNAME = "AESEV",
+    LABEL = "Severity/Intensity"
+  ),
+  c(
+    FLDNAME = "AESER",
+    LABEL = "Serious Event"
+  ),
+  c(
+    FLDNAME = "AEOUT",
+    LABEL = "Outcome of Adverse Event"
+  ),
+  c(
+    FLDNAME = "AESCONG",
+    LABEL = "Congential Anomaly or Birth Defect"
+  ),
+  c(
+    FLDNAME = "AESDISAB",
+    LABEL = "Persist or Signif Disability/Incapacity"
+  ),
+  c(
+    FLDNAME = "AESDTH",
+    LABEL = "Results in Death"
+  ),
+  c(
+    FLDNAME = "AESHOSP",
+    LABEL = "Requires or Prologns Hospitalization"
+  ),
+  c(
+    FLDNAME = "AESLIFE",
+    LABEL = "Is Life Threating"
+  ),
+  c(
+    FLDNAME = "AESMIE",
+    LABEL = "Other Medically Important Serious Event"
+  ),
+  c(
+    FLDNAME = "AECONTRT",
+    LABEL = "Concomitant or Additional Trtmnt Given"
+  ),
+  c(
+    FLDNAME = "AERELAD",
+    LABEL = "Related to Early Stage or Progression of AD"
+  ),
+  c(
+    FLDNAME = "AERELCM",
+    LABEL = "Related to Concomitant Therapy"
+  ),
+  c(
+    FLDNAME = "AERELFLRBTBN",
+    LABEL = "Related to Florbetaben Tracer"
+  ),
+  c(
+    FLDNAME = "AERELFLRBPR",
+    LABEL = "Related to Florbetapir Tracer"
+  ),
+  c(
+    FLDNAME = "AEHIMG",
+    LABEL = "Related to PET/MRI Imaging Procedure"
+  ),
+  c(
+    FLDNAME = "AERELTAU",
+    LABEL = "Related to Flotaucipir Tracer "
+  ),
+  c(
+    FLDNAME = "AERELNAV",
+    LABEL = "Related to NAV-4694 Tracer"
+  ),
+  c(
+    FLDNAME = "AERELMK",
+    LABEL = "Related to MK-6240 Tracer"
+  ),
+  c(
+    FLDNAME = "AERELPI",
+    LABEL = "Related to PI-2620 Tracer"
+  ),
+  c(
+    FLDNAME = "AEHLUMB",
+    LABEL = "Related to Lumbar Puncture"
+  ),
+  c(
+    FLDNAME = "AERELCOVID",
+    LABEL = "Related to COVID-19 Illness"
+  ),
+  c(
+    FLDNAME = "AERELPAN",
+    LABEL = "Related to COVID-19 Pandemic Disruption"
+  ),
+  c(
+    FLDNAME = "AERELATESP",
+    LABEL = "Related to Other Study Procedure(s)"
+  ),
+  c(
+    FLDNAME = "VISITNUM",
+    LABEL = "Visit Number"
+  ),
+  c(
+    FLDNAME = "VISIT",
+    LABEL = "Visit Name"
+  ),
+  c(
+    FLDNAME = "EPOCH",
+    LABEL = "Epoch"
+  ),
+  c(
+    FLDNAME = "AESTDTC",
+    LABEL = "Start Date/Time of Adverse Event"
+  ),
+  c(
+    FLDNAME = "AEENDTC",
+    LABEL = "End Date/Time of Adverse Event"
+  )
+) %>%
+  tibble::as_tibble() %>%
+  relocate(c(FLDNAME, LABEL)) %>%
+  mutate(
+    TEXT = " ",
+    DERIVED = TRUE,
+    TBLNAME = "AE",
+    CRFNAME = "[ Derived ] Adverse Events"
+  )
+
+## ----ae-data-dic-print, eval = TRUE, echo = FALSE-----------------------------
+ae_data_dic %>%
+  select(FLDNAME, LABEL) %>%
+  datatable(., paging = TRUE)
+
+## ----generate-ae-adni34-------------------------------------------------------
+# Adverse Event for ADNI3 and ADNI4
+AE_ADNI34 <- ADVERSE %>%
+  select(
+    ID, RID, ORIGPROT, COLPROT, VISCODE, SITEID, AENUMBER, AEOUTCOME,
+    AEHONSDT, AEHCSDT, AEHDTHDT, AERELAD, AERELCM, AERELFLRBTBN, AERELFLRBPR,
+    AEHIMG, AERELTAU, AERELNAV, AERELMK, AERELPI, AEHLUMB, AERELCOVID, AERELPAN,
+    AERELATESP, AESERIOUS, AESERDATE, SAELIFE, SAEHOSPIT, SAEPROLONG, SAEDEATH,
+    SAECONGEN, SAEDISAB, SAEOTHER, AEHCMEDS,
+    AESEV0 = AEHSEVR, all_of(paste0("AESEV", 1:10))
+  ) %>%
+  generate_oak_id_vars_adni(raw_src = "ADVERSE") %>%
+  assert_non_missing(AENUMBER) %>%
+  # Filter the worst severity level per RID, AENUMBER, COLPROT
+  mutate(across(all_of(paste0("AESEV", 0:10)), as.character)) %>%
+  pivot_longer(
+    cols = all_of(paste0("AESEV", 0:10)),
+    names_to = "SEVERITY_COL",
+    values_to = "AESEV"
+  ) %>%
+  mutate(AESEV_NUM = case_when(
+    AESEV == "Mild" ~ 1,
+    AESEV == "Moderate" ~ 2,
+    AESEV == "Severe" ~ 3
+  )) %>%
+  group_by(RID, ORIGPROT, COLPROT, SITEID, AENUMBER, VISCODE) %>%
+  filter(
+    (all(is.na(AESEV)) & row_number() == 1) |
+      (any(!is.na(AESEV)) & AESEV_NUM == max(AESEV_NUM, na.rm = TRUE))
+  ) %>%
+  filter(
+    (n() > 1 & row_number() == n()) |
+      (n() == 1 & row_number() == 1)
+  ) %>%
+  ungroup() %>%
+  verify(nrow(.) == nrow(ADVERSE)) %>%
+  assert_uniq(RID, ORIGPROT, COLPROT, AENUMBER, VISCODE) %>%
+  rename(
+    "AESER" = AESERIOUS, "AEOUT" = AEOUTCOME,
+    "AESCONG" = SAECONGEN, "AESDISAB" = SAEDISAB, "AESDTH" = SAEDEATH,
+    "AESLIFE" = SAELIFE, "AESMIE" = SAEOTHER, "AECONTRT" = AEHCMEDS,
+    "AESTDTC" = AEHONSDT, "AEENDTC" = AEHCSDT
+  ) %>%
+  # Adverse events for `required or prolongs hospitalization`
+  mutate(
+    AESHOSP = case_when(
+      SAEHOSPIT == "Yes" | SAEPROLONG == "Yes" ~ "Yes",
+      SAEHOSPIT == "No" & SAEPROLONG == "No" ~ "No",
+      SAEHOSPIT == "No" & is.na(SAEPROLONG) ~ "No",
+      is.na(SAEHOSPIT) & SAEPROLONG == "No" ~ "No"
+    )
+  ) %>%
+  select(-c(SAEHOSPIT, SAEPROLONG, AESEV_NUM, SEVERITY_COL))
+
+## ----generate-ae-adni12go-----------------------------------------------------
+# Required checking for missing AENUMBER in RECADV
+AE_ADNI12GO <- tibble(PHASE = NA_character_) %>%
+  na.omit()
+
+## ----generate-ae--------------------------------------------------------------
+AE <- AE_ADNI34 %>%
+  bind_rows(AE_ADNI12GO) %>%
+  assert_non_missing(RID) %>%
+  mutate(
+    AESTDTC = as.character(AESTDTC),
+    AEENDTC = as.character(AEENDTC)
+  ) %>%
+  group_by(RID) %>%
+  arrange(AESTDTC) %>%
+  mutate(AESEQ = row_number()) %>%
+  ungroup()
+
+AE <- AE %>%
+  derive_usubjid() %>%
+  assign_studyid_domain(domain = "AE") %>%
+  assign_visit_attr() %>%
+  assign_epoch() %>%
+  mutate(
+    AEGRPID = COLPROT,
+    AETERM = NA_character_,
+    AELLT = NA_character_,
+    AELLTCD = NA_character_,
+    AEDECOD = NA_character_,
+    AEPTCD = NA_character_,
+    AEHLT = NA_character_,
+    AEHLTCD = NA_character_,
+    AEHLGT = NA_character_,
+    AEHLGTCD = NA_character_,
+    AESOC = NA_character_,
+    AESOCCD = NA_character_
+  ) %>%
+  assign_vars_label(data_dict = ae_data_dic)
+
+## ----qs-data-dic, echo = FALSE------------------------------------------------
+qs_data_dic <- bind_rows(
+  c(
+    FLDNAME = "STUDYID",
+    LABEL = "Study Identifier",
+    TEXT = ""
+  ),
+  c(
+    FLDNAME = "DOMAIN",
+    LABEL = "Domain Abbrevation"
+  ),
+  c(
+    FLDNAME = "USUBJID",
+    LABEL = "Unique Subject Identifier"
+  ),
+  c(
+    FLDNAME = "QSSEQ",
+    LABEL = "Sequence Number"
+  ),
+  c(
+    FLDNAME = "QSGRPID",
+    LABEL = "Group ID",
+    TEXT = "Study Protocol of Data Collection"
+  ),
+  c(
+    FLDNAME = "QSTESTCD",
+    LABEL = "Question Short Name"
+  ),
+  c(
+    FLDNAME = "QSTEST",
+    LABEL = "Question Name"
+  ),
+  c(
+    FLDNAME = "QSCAT",
+    LABEL = "Category of Question"
+  ),
+  c(
+    FLDNAME = "QSORRES",
+    LABEL = "Finding in Original Units"
+  ),
+  c(
+    FLDNAME = "QSSTRESC",
+    LABEL = "Character Result/Finding in Std Format"
+  ),
+  c(
+    FLDNAME = "QSSTRESN",
+    LABEL = "Numeric Finding in Standard Units"
+  ),
+  c(
+    FLDNAME = "QSSTAT",
+    LABEL = "Completion Status"
+  ),
+  c(
+    FLDNAME = "QSREASND",
+    LABEL = "Reason Not Performed"
+  ),
+  c(
+    FLDNAME = "QSBLFL",
+    LABEL = "Baseline Flag"
+  ),
+  c(
+    FLDNAME = "QSDRVFL",
+    LABEL = "Derived Flag"
+  ),
+  c(
+    FLDNAME = "VISITNUM",
+    LABEL = "Visit Number"
+  ),
+  c(
+    FLDNAME = "VISIT",
+    LABEL = "Visit Name"
+  ),
+  # c(
+  #   FLDNAME = "VISITDY",
+  #   LABEL = "(Planned*) Study Day of Visit"
+  # ),
+  c(
+    FLDNAME = "EPOCH",
+    LABEL = "Epoch"
+  ),
+  c(
+    FLDNAME = "QSDTC",
+    LABEL = "Date/Time of Finding"
+  ),
+  c(
+    FLDNAME = "QSDY",
+    LABEL = "Study Day of Finding"
+  )
+) %>%
+  tibble::as_tibble() %>%
+  relocate(c(FLDNAME, LABEL, TEXT)) %>%
+  mutate(TEXT = replace_na(TEXT, " ")) %>%
+  mutate(
+    DERIVED = TRUE,
+    TBLNAME = "QS",
+    CRFNAME = "[ Derived ] Questionnaires"
+  )
+
+## ----qs-data-dic-print, eval = TRUE, echo = FALSE-----------------------------
+qs_data_dic %>%
+  select(FLDNAME, LABEL) %>%
+  datatable(., paging = TRUE)
+
+## ----qs-testcd-list, eval = TRUE, echo = FALSE--------------------------------
+OTHER_QS_TESTCD_LIST <- bind_rows(
+  c(
+    QSCAT = "ADAS-COG",
+    QSTESTCD = "ADASTT11",
+    QSTEST = "ADAS-Cognitive Behavior 11-Item Total Score",
+    SOURCE = "ADAS"
+  ),
+  c(
+    QSCAT = "ADAS-COG",
+    QSTESTCD = "ADASTT13",
+    QSTEST = "ADAS-Cognitive Behavior 13-Item Total Score",
+    SOURCE = "ADAS"
+  ),
+  c(
+    QSCAT = "CDR",
+    QSTESTCD = "CDGLOBAL",
+    QSTEST = "Clinical Dementia Rating Global Score",
+    SOURCE = "CDR"
+  ),
+  c(
+    QSCAT = "CDR",
+    QSTESTCD = "CDRSB",
+    QSTEST = "Clinical Dementia Rating Sum of Boxes",
+    SOURCE = "CDR"
+  ),
+  c(
+    QSCAT = "ECOG SHORT FORM",
+    QSTESTCD = "ECOGPTTT",
+    QSTEST = "Everyday Cognition - Participant",
+    SOURCE = "ECOGPT"
+  ),
+  c(
+    QSCAT = "ECOG SHORT FORM",
+    QSTESTCD = "ECOGSPTT",
+    QSTEST = "Everyday Cognition - Study Partner",
+    SOURCE = "ECOGSP"
+  ),
+  c(
+    QSCAT = "FAQ",
+    QSTESTCD = "FAQTOTAL",
+    QSTEST = "Functional Assessments Questionnaires",
+    SOURCE = "FAQ"
+  ),
+  c(
+    QSCAT = "FCI",
+    QSTESTCD = "FCISCORE",
+    QSTEST = "Financial Capacity Instrument Short Form",
+    SOURCE = "FCI"
+  ),
+  c(
+    QSCAT = "GDS",
+    QSTESTCD = "GDTOTAL",
+    QSTEST = "Geriatric Depression Scale",
+    SOURCE = "GDS"
+  ),
+  c(
+    QSCAT = "MMSE",
+    QSTESTCD = "MMSCORE",
+    QSTEST = "Mini Mental State Exam",
+    SOURCE = "MMSE"
+  ),
+  c(
+    QSCAT = "MOCA",
+    QSTESTCD = "MOCA",
+    QSTEST = "Montreal Cognitive Assessments",
+    SOURCE = "MOCA"
+  ),
+  c(
+    QSCAT = "NPI",
+    QSTESTCD = "NPITOTAL",
+    QSTEST = "Neuropsychiatric Inventory",
+    SOURCE = "NPI"
+  ),
+  c(
+    QSCAT = "NPIQ",
+    QSTESTCD = "NPIQTOTL",
+    QSTEST = "Neuropsychiatric Inventory Q",
+    SOURCE = "NPIQ"
+  )
+)
+
+NEUROBAT_TESTCD <- bind_rows(
+  c(
+    QSTESTCD = "DIGITSCR",
+    QSTEST = "Digit Symbol Substitution"
+  ),
+  c(
+    QSTESTCD = "LDELTOTL",
+    QSTEST = "Logical Memory - Delayed Recall"
+  ),
+  c(
+    QSTESTCD = "LIMMTOTL",
+    QSTEST = "Logical Memory - Immediate Recall"
+  ),
+  c(
+    QSTESTCD = "RAVLTFG",
+    QSTEST = "RAVLT Forgetting (Trial 5 - Delayed)"
+  ),
+  c(
+    QSTESTCD = "RAVLTFGP",
+    QSTEST = "RAVLT Percent Forgetting"
+  ),
+  c(
+    QSTESTCD = "RAVLTIMM",
+    QSTEST = "RVAL Immediate (Sum of 5 Trials)"
+  ),
+  c(
+    QSTESTCD = "RAVLTLRN",
+    QSTEST = "RVAL Learning (Trial 5 - Trial 1)"
+  ),
+  c(
+    QSTESTCD = "TRABSCOR",
+    QSTEST = "Trails B"
+  )
+) %>%
+  mutate(
+    QSCAT = "NEUROBAT",
+    SOURCE = "NEUROBAT"
+  )
+
+if (params$INCLUDE_PACC) {
+  PACC_TESTCD <- bind_rows(
+    c(
+      QSTESTCD = "mPACCdigit",
+      QSTEST = "Modified PACC Digit Score"
+    ),
+    c(
+      QSTESTCD = "mPACCtrailsB",
+      QSTEST = "Modified PACC Trials B Score"
+    ),
+  ) %>%
+    mutate(
+      QSTESTCD = str_to_upper(QSTESTCD),
+      QSCAT = "PACC",
+      SOURCE = "PACC"
+    )
+}
+
+QS_TESTCD_LIST <- bind_rows(
+  OTHER_QS_TESTCD_LIST,
+  NEUROBAT_TESTCD
+) %>%
+  {
+    if (params$INCLUDE_PACC) bind_rows(., PACC_TESTCD) else (.)
+  }
+
+## ----print-qs-testcd-list, eval = TRUE, echo = FALSE--------------------------
+QS_TESTCD_LIST %>%
+  arrange(SOURCE, QSCAT, QSTESTCD) %>%
+  select(SOURCE, QSCAT, QSTESTCD, QSTEST) %>%
+  datatable(., paging = TRUE)
+
+## ----qs-input-----------------------------------------------------------------
+qs_com_cols <- c(
+  "RID", "ORIGPROT", "COLPROT", "VISCODE",
+  "VISCODE2", "VISDATE", "SITEID"
+)
+
+# ADAS Cognitive Behavior Total Score ----
+ADAS_SCORE_DATA <- ADAS %>%
+  select(all_of(qs_com_cols), ADASTT11 = TOTSCORE, ADASTT13 = TOTAL13) %>%
+  generate_oak_id_vars_adni(raw_src = "ADAS") %>%
+  pivot_longer(
+    cols = c(ADASTT11, ADASTT13),
+    names_to = "QSTESTCD",
+    values_to = "QSSTRESC"
+  ) %>%
+  mutate(
+    QSSTRESC = as.character(QSSTRESC),
+    QSDRVFL = "Yes",
+    QSSTAT = ifelse(is.na(QSSTRESC), "NOT DONE", NA_character_)
+  )
+
+# Clinical Dementia Rating Score ----
+CDR_SCORE_DATA <- CDR %>%
+  select(all_of(qs_com_cols), CDGLOBAL, CDRSB) %>%
+  generate_oak_id_vars_adni(raw_src = "CDR") %>%
+  pivot_longer(
+    cols = c(CDGLOBAL, CDRSB),
+    names_to = "QSTESTCD",
+    values_to = "QSSTRESC"
+  ) %>%
+  mutate(
+    QSSTRESC = as.character(QSSTRESC),
+    QSSTAT = ifelse(is.na(QSSTRESC), "NOT DONE", NA_character_)
+  )
+
+# Everyday Cognition Total Score ----
+ECOG_SCORE_DATA <- ECOGPT %>%
+  mutate(QSTESTCD = "ECOGPTTT") %>%
+  select(all_of(qs_com_cols), QSTESTCD, QSSTRESC = EcogPtTotal) %>%
+  generate_oak_id_vars_adni(raw_src = "ECOGPT") %>%
+  bind_rows(
+    ECOGSP %>%
+      mutate(QSTESTCD = "ECOGSPTT") %>%
+      select(all_of(qs_com_cols), QSTESTCD, QSSTRESC = EcogSPTotal) %>%
+      generate_oak_id_vars_adni(raw_src = "ECOGSP")
+  ) %>%
+  mutate(
+    QSSTRESC = as.character(QSSTRESC),
+    QSDRVFL = "Yes",
+    QSSTAT = ifelse(is.na(QSSTRESC), "NOT DONE", NA_character_)
+  )
+
+# Financial Capacity Instrument Short Form - Score ----
+FCI_SCORE_DATA <- FCI %>%
+  select(all_of(qs_com_cols),
+    QSSTRESC = FCISCORE,
+    QSSTAT = DONE, QSREASND = NDREASON
+  ) %>%
+  mutate(
+    QSSTRESC = as.character(QSSTRESC),
+    QSTESTCD = "FCISCORE"
+  ) %>%
+  generate_oak_id_vars_adni(raw_src = "FCI")
+
+# Functional Assessments Questionnaires - Score ----
+FAQ_SCORE_DATA <- FAQ %>%
+  select(all_of(qs_com_cols), QSSTRESC = FAQTOTAL) %>%
+  mutate(
+    QSSTRESC = as.character(QSSTRESC),
+    QSTESTCD = "FAQTOTAL",
+  ) %>%
+  generate_oak_id_vars_adni(raw_src = "FAQ")
+
+# Geriatric Depression Scale ----
+GDS_SCORE_DATA <- GDSCALE %>%
+  select(all_of(qs_com_cols), QSSTRESC = GDTOTAL, QSREASND = GDUNABL) %>%
+  mutate(
+    QSSTRESC = as.character(QSSTRESC),
+    QSTESTCD = "GDTOTAL",
+    QSSTAT = ifelse(!is.na(QSREASND), "NOT DONE", NA_character_)
+  ) %>%
+  generate_oak_id_vars_adni(raw_src = "GDSCALE")
+
+# Mini Mental State Exam Score ----
+MMSE_SCORE_DATA <- MMSE %>%
+  select(all_of(qs_com_cols),
+    QSSTRESC = MMSCORE,
+    QSSTAT = DONE, QSREASND = NDREASON
+  ) %>%
+  mutate(
+    QSSTRESC = as.character(QSSTRESC),
+    QSTESTCD = "MMSCORE",
+    QSDRVFL = "Yes"
+  ) %>%
+  generate_oak_id_vars_adni(raw_src = "MMSE")
+
+# Montreal Cognitive Assessments ----
+MOCA_SCORE_DATA <- MOCA %>%
+  select(all_of(qs_com_cols), QSSTRESC = MOCA) %>%
+  mutate(
+    QSSTRESC = as.character(QSSTRESC),
+    QSTESTCD = "MOCA",
+    QSDRVFL = "Yes"
+  ) %>%
+  generate_oak_id_vars_adni(raw_src = "MOCA")
+
+# Neuropsychiatric Inventory ----
+NPI_SCORE_DATA <- NPI %>%
+  rename("VISDATE" = EXAMDATE) %>%
+  select(all_of(qs_com_cols), QSSTRESC = NPITOTAL) %>%
+  mutate(
+    QSSTRESC = as.character(QSSTRESC),
+    QSTESTCD = "NPITOTAL",
+    QSDRVFL = "Yes",
+    QSSTAT = ifelse(is.na(QSSTRESC), "NOT DONE", NA_character_)
+  ) %>%
+  generate_oak_id_vars_adni(raw_src = "NPI")
+
+# Neuropsychiatric Inventory Q ----
+NPIQ_SCORE_DATA <- NPIQ %>%
+  select(all_of(qs_com_cols), QSSTRESC = NPISCORE) %>%
+  mutate(
+    QSSTRESC = as.character(QSSTRESC),
+    QSTESTCD = "NPIQTOTL",
+    QSDRVFL = "Yes",
+    QSSTAT = ifelse(is.na(QSSTRESC), "NOT DONE", NA_character_)
+  ) %>%
+  generate_oak_id_vars_adni(raw_src = "NPIQ")
+
+# Logical Memory - Immediate/Delayed Recall ----
+neurobat_cols <- c(
+  "LIMMTOTL", "LDELTOTL", "DIGITSCR", "TRABSCOR",
+  "RAVLTIMM", "RAVLTLRN", "RAVLTFG", "RAVLTFGP"
+)
+NEUROBAT_SCORE_DATA <- NEUROBAT %>%
+  compute_neurobat_subscore(.neurobat = .) %>%
+  select(all_of(c(qs_com_cols, neurobat_cols))) %>%
+  generate_oak_id_vars_adni(raw_src = "NEUROBAT") %>%
+  pivot_longer(
+    cols = all_of(neurobat_cols),
+    names_to = "QSTESTCD",
+    values_to = "QSSTRESC"
+  ) %>%
+  mutate(
+    QSSTRESC = as.character(QSSTRESC),
+    QSDRVFL = case_when(
+      QSTESTCD %in% c(
+        "RAVLTIMM", "RAVLTRN", "RAVLTFG", "RAVLTFGP"
+      ) ~ "Yes"
+    ),
+    QSSTAT = ifelse(is.na(QSSTRESC), "NOT DONE", NA_character_)
+  )
+
+# Composite modified PACC score
+if (params$INCLUDE_PACC) {
+  pacc_cols <- c("mPACCdigit", "mPACCtrailsB")
+
+  PACC_SCORE_DATA <- PACC %>%
+    rename("VISDATE" = PACC_VISDATE) %>%
+    select(any_of(qs_com_cols), all_of(pacc_cols)) %>%
+    mutate(RID = as.numeric(RID)) %>%
+    generate_oak_id_vars_adni(raw_src = "PACC") %>%
+    pivot_longer(
+      cols = all_of(pacc_cols),
+      names_to = "QSTESTCD",
+      values_to = "QSSTRESC"
+    ) %>%
+    mutate(
+      QSTESTCD = str_to_upper(QSTESTCD),
+      QSSTRESC = as.character(QSSTRESC),
+      QSDRVFL = "Yes",
+      QSSTAT = ifelse(is.na(QSSTRESC), "NOT DONE", NA_character_)
+    )
+}
+
+# Score data names
+score_data_names <- ls()[str_detect(ls(), "SCORE\\_DATA")]
+
+## ----generate-qs--------------------------------------------------------------
+QS <- mget(score_data_names) %>%
+  bind_rows() %>%
+  assert_non_missing(RID, COLPROT, VISCODE, QSTESTCD, VISCODE) %>%
+  mutate(
+    QSGRPID = COLPROT,
+    QSDTC = create_iso8601(as.character(VISDATE), .format = "y-m-d"),
+    QSSTRESN = as.numeric(QSSTRESC),
+    QSORRES = as.character(QSSTRESN),
+    QSSTAT = case_when(
+      QSSTAT %in% c("No", "NOT DONE") ~ "NOT DONE",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  set_dom_test(
+    .data_list = QS_TESTCD_LIST %>%
+      select(QSTESTCD, QSTEST, QSCAT),
+    merge_by = "QSTESTCD"
+  ) %>%
+  assert_uniq(RID, COLPROT, VISCODE, QSTESTCD) %>%
+  derive_usubjid() %>%
+  assign_studyid_domain(domain = "QS") %>%
+  assign_visit_attr() %>%
+  assign_epoch() %>%
+  derive_blfl_adni(
+    dm_domain = DM,
+    tgt_var = "QSBLFL"
+  ) %>%
+  derive_study_day_adni(
+    dm_domain = DM,
+    domain = "QS"
+  ) %>%
+  derive_seq(
+    tgt_var = "QSSEQ",
+    rec_vars = c("USUBJID", "QSTESTCD", "COLPROT")
+  ) %>%
+  # # Update QSORRES for derived scores
+  # mutate(QSORRES = case_when(is.na(QSDRVFL) ~ QSSTRESC)) %>%
+  assign_vars_label(data_dict = qs_data_dic)
+
+## ----rs-data-dic, echo = FALSE------------------------------------------------
+rs_data_dic <- bind_rows(
+  c(
+    FLDNAME = "STUDYID",
+    LABEL = "Study Identifier",
+    TEXT = ""
+  ),
+  c(
+    FLDNAME = "DOMAIN",
+    LABEL = "Domain Abbrevation"
+  ),
+  c(
+    FLDNAME = "USUBJID",
+    LABEL = "Unique Subject Identifier"
+  ),
+  c(
+    FLDNAME = "RSSEQ",
+    LABEL = "Sequence Number"
+  ),
+  c(
+    FLDNAME = "RSGRPID",
+    LABEL = "Group ID",
+    TEXT = "Study Protocol of Data Collection"
+  ),
+  c(
+    FLDNAME = "RSTESTCD",
+    LABEL = "Assessment Short Name"
+  ),
+  c(
+    FLDNAME = "RSTEST",
+    LABEL = "Assessment Name"
+  ),
+  c(
+    FLDNAME = "RSCAT",
+    LABEL = "Category for Assessment"
+  ),
+  c(
+    FLDNAME = "RSORRES",
+    LABEL = "Result or Finding in Original Units"
+  ),
+  c(
+    FLDNAME = "RSSTRESC",
+    LABEL = "Character Result/Finding in Std Format"
+  ),
+  c(
+    FLDNAME = "RSBLFL",
+    LABEL = "Baseline Flag"
+  ),
+  c(
+    FLDNAME = "RSEVAL",
+    LABEL = "Evaluator",
+    TEXT = "SITEID will be used instead of actual evaluator initial."
+  ),
+  c(
+    FLDNAME = "VISITNUM",
+    LABEL = "Visit Number"
+  ),
+  c(
+    FLDNAME = "VISIT",
+    LABEL = "Visit Name"
+  ),
+  # c(
+  #   FLDNAME = "VISITDY",
+  #   LABEL = "(Planned*) Study Day of Visit"
+  # ),
+  c(
+    FLDNAME = "EPOCH",
+    LABEL = "Epoch"
+  ),
+  c(
+    FLDNAME = "RSDTC",
+    LABEL = "Date/Time of Assessment"
+  ),
+  c(
+    FLDNAME = "RSDY",
+    LABEL = "Study Day of Assessment"
+  )
+) %>%
+  tibble::as_tibble() %>%
+  relocate(FLDNAME, LABEL, TEXT) %>%
+  mutate(TEXT = replace_na(TEXT, " ")) %>%
+  mutate(
+    DERIVED = TRUE,
+    TBLNAME = "RS",
+    CRFNAME = "[ Derived ] Clinical Classification"
+  )
+
+## ----rs-data-dic-print, eval = TRUE, echo = FALSE-----------------------------
+rs_data_dic %>%
+  select(FLDNAME, LABEL, TEXT) %>%
+  datatable(., paging = TRUE)
+
+## ----rs-testcd-list, eval = TRUE, echo = FALSE--------------------------------
+# Recommended to check variable name length and test labels
+RS_TESTCD_LIST <- bind_rows(
+  c(
+    RSCAT = "DIAGNOSTICS",
+    RSTESTCD = "DX",
+    RSTEST = "Clinical Diagnostics Status",
+    SOURCE = "DXSUM"
+  )
+)
+
+RS_TESTCD_LIST %>%
+  arrange(SOURCE, RSCAT, RSTESTCD) %>%
+  select(SOURCE, RSCAT, RSTESTCD, RSTEST) %>%
+  datatable()
+
+## ----generate-rs0-------------------------------------------------------------
+# Clinical diagnostics status
+RS <- DXSUM %>%
+  generate_oak_id_vars_adni(raw_src = "DXSUM") %>%
+  mutate(
+    DIAGNOSIS = case_when(
+      DIAGNOSIS %in% "Dementia" ~ "DEM",
+      TRUE ~ as.character(DIAGNOSIS)
+    ),
+    RSTESTCD = "DX",
+    RSORRES = as.character(DIAGNOSIS),
+    RSSTRESC = as.character(DIAGNOSIS),
+    RSEVAL = SITEID,
+    RSDTC = create_iso8601(as.character(EXAMDATE), .format = "y-m-d"),
+    RSGRPID = COLPROT,
+    RSSTAT = NA_character_
+  ) %>%
+  assert_non_missing(COLPROT)
+
+## ----generate-rs1-------------------------------------------------------------
+RS <- RS %>%
+  set_dom_test(
+    .data_list = RS_TESTCD_LIST %>%
+      select(RSCAT, RSTEST, RSTESTCD),
+    merge_by = "RSTESTCD"
+  ) %>%
+  derive_usubjid() %>%
+  assign_studyid_domain(domain = "RS") %>%
+  assign_visit_attr() %>%
+  assign_epoch() %>%
+  derive_blfl_adni(
+    dm_domain = DM,
+    tgt_var = "RSBLFL"
+  ) %>%
+  derive_study_day_adni(
+    dm_domain = DM,
+    domain = "RS"
+  ) %>%
+  derive_seq(
+    tgt_var = "RSSEQ",
+    rec_vars = c("USUBJID", "RSTESTCD", "COLPROT")
+  ) %>%
+  assign_vars_label(data_dict = rs_data_dic)
+
+## ----nv-data-dic, echo = FALSE------------------------------------------------
+nv_data_dic <- bind_rows(
+  c(
+    FLDNAME = "STUDYID",
+    LABEL = "Study Identifier",
+    TEXT = ""
+  ),
+  c(
+    FLDNAME = "DOMAIN",
+    LABEL = "Domain Abbrevation"
+  ),
+  c(
+    FLDNAME = "USUBJID",
+    LABEL = "Unique Subject Identifier"
+  ),
+  c(
+    FLDNAME = "NVSEQ",
+    LABEL = "Sequence Number"
+  ),
+  c(
+    FLDNAME = "NVGRPID",
+    LABEL = "Group ID",
+    TEXT = "Study Protocol of Data Collection"
+  ),
+  c(
+    FLDNAME = "NVLNKID",
+    LABEL = "Link ID"
+  ),
+  c(
+    FLDNAME = "NVTESTCD",
+    LABEL = "Short Name of Nervous System Test"
+  ),
+  c(
+    FLDNAME = "NVTEST",
+    LABEL = "Name of Nervous System Test"
+  ),
+  c(
+    FLDNAME = "NVCAT",
+    LABEL = "Category for Nervous System"
+  ),
+  c(
+    FLDNAME = "NVSCAT",
+    LABEL = "Subcategory for Nervous System"
+  ),
+  c(
+    FLDNAME = "NVORRES",
+    LABEL = "Result or Finding in Original Units"
+  ),
+  c(
+    FLDNAME = "NVSTRESC",
+    LABEL = "Character Result/Finding in Std Format"
+  ),
+  c(
+    FLDNAME = "NVSTRESN",
+    LABEL = "Numeric Result/Finding in Standard Units"
+  ),
+  # c(
+  #   FLDNAME = "NVSTRESU",
+  #   LABEL = "Standard Units"
+  # ),
+  c(
+    FLDNAME = "NVSTAT",
+    LABEL = "Completion Status"
+  ),
+  c(
+    FLDNAME = "NVREASND",
+    LABEL = "Reason Not Done"
+  ),
+  c(
+    FLDNAME = "NVMETHOD",
+    LABEL = "Method of Test or Examination"
+  ),
+  c(
+    FLDNAME = "NVBLFL",
+    LABEL = "Baseline Flag"
+  ),
+  c(
+    FLDNAME = "NVDRVFL",
+    LABEL = "Derived Flag"
+  ),
+  c(
+    FLDNAME = "VISITNUM",
+    LABEL = "Visit Number"
+  ),
+  c(
+    FLDNAME = "VISIT",
+    LABEL = "Visit Name"
+  ),
+  # c(
+  #   FLDNAME = "VISITDY",
+  #   LABEL = "(Planned*) Study Day of Visit"
+  # ),
+  c(
+    FLDNAME = "EPOCH",
+    LABEL = "Epoch"
+  ),
+  c(
+    FLDNAME = "NVDTC",
+    LABEL = "Date/Time of Collection"
+  ),
+  c(
+    FLDNAME = "NVDY",
+    LABEL = "Study Day of Collection"
+  )
+) %>%
+  tibble::as_tibble() %>%
+  relocate(c(FLDNAME, LABEL, TEXT)) %>%
+  mutate(TEXT = replace_na(TEXT, " ")) %>%
+  mutate(
+    DERIVED = TRUE,
+    TBLNAME = "NV",
+    CRFNAME = "[ Derived ] Nervous System Finding"
+  )
+
+## ----nv-data-dic-print, eval = TRUE, echo = FALSE-----------------------------
+nv_data_dic %>%
+  select(FLDNAME, LABEL, TEXT) %>%
+  datatable(., paging = TRUE)
+
+## ----nv-testcd-list, eval = TRUE, echo = FALSE--------------------------------
+# Recommended to check variable name length and test labels
+AMYPET_TESTCD <- bind_rows(
+  c(
+    NVCAT = "AMYLOIDPET",
+    NVTESTCD = "AMYSTAT",
+    NVTEST = "Amyloid Status - Centiloids",
+    TEXT = paste0(
+      "Amyloid status determined based on centiloids that normalized by",
+      "whole cerebellum. ",
+      "UC Berkeley - Amyloid PET 6mm Res analysis."
+    )
+  ),
+  c(
+    NVCAT = "AMYLOIDPET",
+    NVTESTCD = "AMYSTATC",
+    NVTEST = "Amyloid Status - Centiloids Composite Ref",
+    TEXT = paste0(
+      "Amyloid status determined based on centiloids that normalized by ",
+      "composite reference region. ",
+      "UC Berkeley - Amyloid PET 6mm Res analysis."
+    )
+  ),
+  c(
+    NVCAT = "AMYLOIDPET",
+    NVTESTCD = "CENTILOIDS",
+    NVTEST = "Centiloids",
+    TEXT = paste0(
+      "Summary cortical SUVR normalized by whole cerebellum and transformed",
+      " to Centiloids. ",
+      "UC Berkeley - Amyloid PET 6mm Res analysis."
+    )
+  ),
+  c(
+    NVCAT = "AMYLOIDPET",
+    NVTESTCD = "SUVRSM",
+    NVTEST = "Summary Cortical SUVR",
+    TEXT = paste0(
+      "Summary cortical SUVR normalized by whole cerebellum. ",
+      "UC Berkeley - Amyloid PET 6mm Res analysis."
+    )
+  ),
+  c(
+    NVCAT = "AMYLOIDPET",
+    NVTESTCD = "SUVRCR",
+    NVTEST = "Summary Cortical SUVR Composite Ref",
+    TEXT = paste0(
+      "Summary cortical SUVR normalized by composite reference region. ",
+      "UC Berkeley - Amyloid PET 6mm Res analysis."
+    )
+  )
+) %>%
+  mutate(SOURCE = "UCBERKELEY_AMY_6MM") %>%
+  expand_grid(NVSCAT = c("FBB-6MM", "FBB-8MM", "FBP-6MM", "FBP-8MM", "NAV-6MM"))
+
+TAUPET_TESTCD <- bind_rows(
+  c(
+    NVCAT = "TAUPET",
+    NVTESTCD = "SUVRINFE",
+    NVTEST = "Standard Uptake Value - Inferior CGM",
+    TEXT = paste0(
+      "Reference region - mean SUVR of inferior cerebellar grey matter. ",
+      "UC Berkeley - Tau PET 6mm Res analysis."
+    )
+  ),
+  c(
+    NVCAT = "TAUPET",
+    NVTESTCD = "SUVRSC",
+    NVTEST = "Standard Uptake Value - SCWM",
+    TEXT = paste0(
+      "Reference region - mean SUVR of subcortical white matter eroded",
+      "away from cortex. ",
+      "UC Berkeley - Tau PET 6mm Res analysis."
+    )
+  ),
+  c(
+    NVCAT = "TAUPET",
+    NVTESTCD = "SUVRMETA",
+    NVTEST = "Weighted Standard Uptake Value",
+    TEXT = paste0(
+      "Weighted mean SUVR of Jack et al temporal meta-ROI. ",
+      "UC Berkeley - Tau PET 6mm Res analysis."
+    )
+  )
+) %>%
+  mutate(SOURCE = "UCBERKELEY_TAU_6MM") %>%
+  expand_grid(NVSCAT = c("FTP-6MM", "FTP-8MM", "MK6240-6MM", "PI2620-6MM"))
+
+TAUPETPVC_TESTCD <- bind_rows(
+  c(
+    NVCAT = "TAUPETPVC",
+    NVTESTCD = "SUVRINFE",
+    NVTEST = "Standard Uptake Value - Inferior CGM",
+    TEXT = paste0(
+      "Reference region - mean SUVR of inferior cerebellar grey matter. ",
+      "UC Berkeley - Tau PET PVC 6mm Res analysis."
+    )
+  ),
+  c(
+    NVCAT = "TAUPETPVC",
+    NVTESTCD = "SUVRCWM",
+    NVTEST = "Standard Uptake Value - CWM",
+    TEXT = paste0(
+      "Bilateral cerebral white matter.",
+      "UC Berkeley - Tau PET PVC 6mm Res analysis."
+    )
+  ),
+  c(
+    NVCAT = "TAUPETPVC",
+    NVTESTCD = "SUVRMETA",
+    NVTEST = "Weighted Standard Uptake Value",
+    TEXT = paste0(
+      "Weighted mean SUVR of Jack et al temporal meta-ROI. ",
+      "UC Berkeley - Tau PET PVC 6mm Res analysis."
+    )
+  )
+) %>%
+  mutate(SOURCE = "UCBERKELEY_TAUPVC_6MM") %>%
+  expand_grid(NVSCAT = c("FTP-NONE", "MK6240-NONE", "PI2620-NONE"))
+
+NV_TESTCD_LIST <- bind_rows(
+  c(
+    NVCAT = "FDG-8MM",
+    NVTESTCD = "FDGMROI",
+    NVTEST = "FDG-PET metaROI 8mm",
+    TEXT = "UC Berkeley - FDG analysis: 2023-02-17. Available for ADNI1-3.",
+    SOURCE = "UCBERKELEYFDG_8mm"
+  ),
+  c(
+    NVCAT = "PIBPETSV",
+    NVTESTCD = "PIB",
+    NVTEST = "Average PIB PET SUVr",
+    TEXT = "U Pitt PIB PET Analysis. Only available for ADNI1.",
+    SOURCE = "PIBPETSUVR"
+  ),
+  c(
+    NVCAT = "AMYLOID-STATUS",
+    NVTESTCD = "AMYSTAT",
+    NVTEST = "Amyloid Status - Clinician Judgment",
+    TEXT = "Avaiable for ADNI4 phase.",
+    SOURCE = "AMYREAD"
+  ),
+  AMYPET_TESTCD,
+  TAUPET_TESTCD,
+  TAUPETPVC_TESTCD
+) %>%
+  mutate(NVSCAT = ifelse(is.na(NVSCAT), NVCAT, NVSCAT)) %>%
+  separate(NVSCAT,
+    into = c("TRACER", "IMAGE_RESOLUTION"),
+    sep = "-",
+    remove = FALSE
+  ) %>%
+  mutate(across(
+    all_of(c("TRACER", "IMAGE_RESOLUTION")),
+    ~ case_when(
+      is.na(.x) | .x %in% c("PIBPETSV", "AMYLOID", "STATUS") ~ " - ",
+      TRUE ~ as.character(.x)
+    )
+  ))
+
+## ----nv-testcd-list-print, eval = TRUE, echo = FALSE--------------------------
+NV_TESTCD_LIST %>%
+  arrange(NVCAT, NVTESTCD) %>%
+  select(
+    SOURCE, NVTESTCD, NVTEST, NVCAT, NVSCAT,
+    `TRACER TYPE` = TRACER,
+    `IMAGE RESOLUTION` = IMAGE_RESOLUTION, DESCRIPTION = TEXT,
+  ) %>%
+  datatable(paging = TRUE, filter = "top") %>%
+  formatStyle("DESCRIPTION", fontSize = "10px")
+
+## ----nv-input1----------------------------------------------------------------
+# FDG-PET Analysis Results Data ----
+FDG_PET_DATA <- UCBERKELEYFDG_8mm %>%
+  # Based on method manual document
+  select(ORIGPROT, RID, VISCODE, VISCODE2, EXAMDATE, ROINAME, MEAN) %>%
+  filter(!is.na(VISCODE)) %>%
+  assert_uniq(RID, VISCODE, VISCODE2, ROINAME) %>%
+  verify(all(ORIGPROT %in% adni_phase()[-5])) %>%
+  pivot_wider(
+    id_cols = everything(),
+    names_from = "ROINAME",
+    values_from = "MEAN"
+  ) %>%
+  mutate(FDGMROI = MetaROI / Top50PonsVermis) %>%
+  select(-MetaROI, -Top50PonsVermis) %>%
+  check_duplicate_records(col_names = c("RID", "EXAMDATE", "VISCODE")) %>%
+  mutate(
+    NVMETHOD = "FDG PET",
+    NVTESTCD = "FDGMROI",
+    NVORRES = as.character(FDGMROI),
+    NVSTRESC = as.character(FDGMROI),
+    NVSTRESN = FDGMROI,
+    NVDRVFL = "Yes",
+    NVDTC = as.character(EXAMDATE)
+  ) %>%
+  generate_oak_id_vars_adni(raw_src = "UCBERKELEYFDG_8mm")
+
+# Mapping phase-specific visit code based opn registry
+FDG_PET_DATA <- FDG_PET_DATA %>%
+  # Trying to map visit code from registry
+  use_dtplyr() %>%
+  left_join(
+    REGISTRY %>%
+      mutate(EXAMDATE = as.character(EXAMDATE)) %>%
+      select(RID, ORIGPROT, COLPROT, VISCODE, VISCODE2,
+        REGISTRY.EXAMDATE = EXAMDATE
+      ) %>%
+      filter(!is.na(REGISTRY.EXAMDATE)) %>%
+      filter(RID %in% unique(FDG_PET_DATA$RID)) %>%
+      distinct() %>%
+      check_duplicate_records(
+        col_names = c("RID", "ORIGPROT", "VISCODE", "REGISTRY.EXAMDATE")
+      ),
+    by = c("RID", "ORIGPROT", "VISCODE", "VISCODE2")
+  ) %>%
+  as_tibble() %>%
+  mutate(COLPROT = case_when(
+    is.na(COLPROT) & VISCODE == VISCODE2 ~ ORIGPROT,
+    is.na(COLPROT) & VISCODE != VISCODE2 & VISCODE2 %in% "bl" ~ ORIGPROT,
+    TRUE ~ COLPROT
+  )) %>%
+  verify(nrow(.) == nrow(FDG_PET_DATA)) %>%
+  assert_non_missing(COLPROT) %>%
+  assert_uniq(RID, COLPROT, VISCODE, NVTESTCD)
+
+## ----nv-input2----------------------------------------------------------------
+# PIB PET Analysis Results Data -----
+# Only for ADNI1 phase
+PIB_PET_DATA <- PIBPETSUVR %>%
+  verify(all(ORIGPROT == adni_phase()[1])) %>%
+  # Based on previously generated dataset
+  mutate(PIB = rowMeans(across(c("ACG", "FRC", "PAR", "PRC")), na.rm = FALSE)) %>%
+  select(RID, ORIGPROT, VISCODE, EXAMDATE, NVSTRESN = PIB, LONIUID) %>%
+  check_duplicate_records(col_names = c("RID", "EXAMDATE")) %>%
+  mutate(
+    NVMETHOD = "PET",
+    NVTESTCD = "PIB",
+    NVSTRESU = NA_character_,
+    NVORRES = as.character(NVSTRESN),
+    NVSTRESC = as.character(NVSTRESN),
+    NVDRVFL = "Yes",
+    NVDTC = as.character(EXAMDATE),
+    NVLNKID = as.character(LONIUID),
+    COLPROT = adni_phase()[1]
+  ) %>%
+  assert_non_missing(VISCODE) %>%
+  assert_uniq(RID, VISCODE, NVTESTCD) %>%
+  generate_oak_id_vars_adni(raw_src = "PIBPETSUVR")
+
+## ----nv-input3----------------------------------------------------------------
+# Amyloid status ----
+amystatus_lvls <- c("Non Elevated", "Elevated")
+
+AMYREAD_DATA <- AMYREAD %>%
+  verify(all(COLPROT == adni_phase()[5])) %>%
+  # Based on clinicians' decision
+  mutate(AMYSTAT = case_when(
+    str_detect(CONSENS, "No, visual read and quantification") ~ as.character(CONGRU),
+    str_detect(CONSENS, "Yes, this scan should be reviewed") ~ as.character(CONSENSRES)
+  )) %>%
+  mutate(
+    AMYSTAT = str_remove(AMYSTAT, " scan"),
+    TRACERTYPE = as.character(TRACERTYPE)
+  ) %>%
+  verify(all(AMYSTAT %in% amystatus_lvls)) %>%
+  generate_oak_id_vars_adni(raw_src = "AMYREAD") %>%
+  pivot_longer(
+    cols = AMYSTAT,
+    names_to = "NVTESTCD",
+    values_to = "NVORRES"
+  ) %>%
+  mutate(
+    NVDTC = as.character(SCANDATE),
+    NVSTRESC = as.character(NVORRES),
+    NVMETHOD = "PET",
+    NVDRVFL = "Yes"
+  )
+
+## ----nv-imaging-mapping-list, echo=FALSE--------------------------------------
+# Imaging mapping List ----
+imaging_cols <- c(
+  "ORIGPROT", "COLPROT", "RID", "VISCODE", "SCANDATE", "LONIUID"
+)
+IMAGING_MAPPING_LIST <- bind_rows(
+  AMYQC %>%
+    select(all_of(imaging_cols)) %>%
+    mutate(SOURCE = "AMYQC"),
+  AV45QC %>%
+    rename("SCANDATE" = EXAMDATE) %>%
+    select(all_of(imaging_cols)) %>%
+    mutate(SOURCE = "AV45QC"),
+  PETQC %>%
+    rename("SCANDATE" = EXAMDATE) %>%
+    select(all_of(imaging_cols)) %>%
+    mutate(SOURCE = "PETQC"),
+  TAUQC %>%
+    select(all_of(imaging_cols)) %>%
+    mutate(SOURCE = "TAUQC"),
+  PIBQC %>%
+    mutate(
+      COLPROT = adni_phase()[1],
+      SCANDATE = EXAMDATE
+    ) %>%
+    select(all_of(imaging_cols)) %>%
+    mutate(SOURCE = "PIBQC"),
+) %>%
+  filter(!is.na(LONIUID)) %>%
+  use_dtplyr() %>%
+  group_by(RID, SCANDATE) %>%
+  filter((all(n() >= 1) & row_number() == n())) %>%
+  ungroup() %>%
+  as_tibble() %>%
+  assert_uniq(all_of(c("RID", "SCANDATE")))
+
+## ----nv-amypet----------------------------------------------------------------
+# Common cols in PET data
+pet_data_common_cols <- c(
+  "ORIGPROT", "LONIUID", "RID", "VISCODE", "SCANDATE", "PROCESSDATE",
+  "IMAGE_RESOLUTION", "TRACER", "qc_flag"
+)
+
+# Amyloid PET Data ----
+amypet_cols <- list(
+  AMYSTAT = "AMYLOID_STATUS",
+  AMYSTATC = "AMYLOID_STATUS_COMPOSITE_REF",
+  SUVRSM = "SUMMARY_SUVR",
+  SUVRCR = "COMPOSITE_REF_SUVR",
+  CENTILOIDS = "CENTILOIDS"
+)
+
+AMYPET_DATA <- UCBERKELEY_AMY_6MM %>%
+  mutate(across(
+    all_of(as.character(amypet_cols[1:2])),
+    ~ case_when(
+      .x == 1 ~ amystatus_lvls[2],
+      .x == 0 ~ amystatus_lvls[1]
+    )
+  )) %>%
+  rename_with_list(., name_char = amypet_cols, by_name = TRUE) %>%
+  select(all_of(c(pet_data_common_cols, names(amypet_cols)))) %>%
+  mutate(across(all_of(names(amypet_cols)), as.character)) %>%
+  distinct() %>%
+  generate_oak_id_vars_adni(raw_src = "UCBERKELEY_AMY_6MM") %>%
+  pivot_longer(
+    cols = all_of(names(amypet_cols)),
+    names_to = "NVTESTCD",
+    values_to = "NVSTRESC"
+  )
+
+## ----nv-taupet----------------------------------------------------------------
+# Tau PET Data -----
+taupet_cols <- list(
+  SUVRINFE = "INFERIORCEREBELLUM_SUVR",
+  SUVRSC = "ERODED_SUBCORTICALWM_SUVR",
+  SUVRMETA = "META_TEMPORAL_SUVR"
+)
+TAUPET_DATA <- UCBERKELEY_TAU_6MM %>%
+  # filter(!is.na(VISCODE)) %>%
+  rename_with_list(., name_char = taupet_cols, by_name = TRUE) %>%
+  select(all_of(c(pet_data_common_cols, names(taupet_cols)))) %>%
+  mutate(across(all_of(names(taupet_cols)), as.character)) %>%
+  generate_oak_id_vars_adni(raw_src = "UCBERKELEY_TAU_6MM") %>%
+  pivot_longer(
+    cols = all_of(names(taupet_cols)),
+    names_to = "NVTESTCD",
+    values_to = "NVSTRESC"
+  )
+
+# Tau PET - PVC Data ----
+taupet_pvc_cols <- list(
+  SUVRINFE = "INFERIORCEREBELLUM_SUVR",
+  SUVRCWM = "CEREBRAL_WHITE_MATTER_SUVR",
+  SUVRMETA = "META_TEMPORAL_SUVR"
+)
+TAUPET_PVC_DATA <- UCBERKELEY_TAUPVC_6MM %>%
+  mutate(
+    IMAGE_RESOLUTION = "None",
+    qc_flag = NA_real_
+  ) %>%
+  rename_with_list(., name_char = taupet_pvc_cols, by_name = TRUE) %>%
+  select(all_of(c(pet_data_common_cols, names(taupet_pvc_cols)))) %>%
+  mutate(across(all_of(names(taupet_pvc_cols)), as.character)) %>%
+  generate_oak_id_vars_adni(raw_src = "UCBERKELEY_TAUPVC_6MM") %>%
+  pivot_longer(
+    cols = all_of(names(taupet_pvc_cols)),
+    names_to = "NVTESTCD",
+    values_to = "NVSTRESC"
+  )
+
+## ----nv-petdata---------------------------------------------------------------
+# PET dataset
+PET_join_var <- paste0(c("ORIGPROT", "RID", "SCANDATE"), "_MPL")
+names(PET_join_var) <- str_remove_all(PET_join_var, "\\_MPL")
+
+PET_DATA <- bind_rows(AMYPET_DATA, TAUPET_DATA, TAUPET_PVC_DATA) %>%
+  select(-VISCODE) %>%
+  # Fuzzy join for actual study phase and visits
+  left_fuzzy_join(
+    data1 = .,
+    data2 = IMAGING_MAPPING_LIST %>%
+      select(ORIGPROT, COLPROT, RID, VISCODE, SCANDATE, SOURCE) %>%
+      rename_with_list(., name_char = PET_join_var, by_name = FALSE),
+    join_by = PET_join_var,
+    check_cols = "COLPROT",
+    main_cols = "SCANDATE",
+    date_col = "SCANDATE"
+  ) %>%
+  mutate(
+    LONIUID = as.character(LONIUID),
+    NVMETHOD = "PET",
+    NVDTC = as.character(SCANDATE),
+    NVLNKID = as.character(LONIUID),
+    NVORRES = as.character(NVSTRESC),
+    NVSTRESN = as.numeric(NVSTRESC),
+    NVSTAT = case_when(qc_flag %in% -2:0 ~ "NOT DONE"),
+    NVREASND = case_when(
+      qc_flag == -2 ~ "CANNOT BE PROCESSED",
+      qc_flag == -1 ~ "NOT ASSESSED",
+      qc_flag == 0 ~ "FAIL"
+    )
+  ) %>%
+  assert_non_missing(COLPROT)
+
+## ----generate-nv--------------------------------------------------------------
+NV <- bind_rows(FDG_PET_DATA, PIB_PET_DATA, AMYREAD_DATA, PET_DATA) %>%
+  mutate(
+    NVGRPID = COLPROT,
+    NVDTC = create_iso8601(NVDTC, .format = "y-m-d")
+  ) %>%
+  mutate(NVSCAT_MAPID = case_when(
+    str_detect(raw_source, "^UCBERKELEY_") ~ toupper(paste0(TRACER, "-", IMAGE_RESOLUTION)),
+    !str_detect(raw_source, "^UCBERKELEY_") ~ "-"
+  ))
+
+NV <- NV %>%
+  left_join(
+    NV_TESTCD_LIST %>%
+      select(NVCAT, NVSCAT, NVTESTCD, NVTEST, SOURCE) %>%
+      mutate(NVSCAT_MAPID = case_when(
+        str_detect(SOURCE, "^UCBERKELEY_") ~ NVSCAT,
+        !str_detect(SOURCE, "^UCBERKELEY_") ~ "-"
+      )),
+    by = c("NVTESTCD" = "NVTESTCD", "raw_source" = "SOURCE", "NVSCAT_MAPID" = "NVSCAT_MAPID"),
+    relationship = "many-to-many"
+  ) %>%
+  verify(nrow(.) == nrow(NV)) %>%
+  assert_non_missing(NVTEST, NVSCAT, NVCAT) %>%
+  derive_usubjid() %>%
+  assign_studyid_domain(domain = "NV") %>%
+  assign_visit_attr() %>%
+  assign_epoch()
+
+# Adjusting for the same NVTESTCD that comes from multiple raw sources
+nv_grp_cols <- c("NVTESTCD", "NVCAT", "NVSCAT", "IMAGE_RESOLUTION", "TRACER")
+NV <- NV %>%
+  unite("NVTESTCD", all_of(nv_grp_cols), sep = "-/") %>%
+  derive_blfl_adni(
+    sdtm_in = .,
+    dm_domain = DM,
+    tgt_var = "NVBLFL"
+  ) %>%
+  separate(NVTESTCD, into = nv_grp_cols, sep = "-/") %>%
+  assert_non_missing(NVTESTCD)
+
+NV <- NV %>%
+  derive_study_day_adni(
+    dm_domain = DM,
+    domain = "NV"
+  ) %>%
+  derive_seq(
+    tgt_var = "NVSEQ",
+    rec_vars = c("USUBJID", "NVCAT", "NVSCAT", "NVTESTCD", "NVGRPID")
+  ) %>%
+  assign_vars_label(nv_data_dic)
+
+## ----lb-data-dic, echo = FALSE------------------------------------------------
+lb_data_dic <- bind_rows(
+  c(
+    FLDNAME = "STUDYID",
+    LABEL = "Study Identifier",
+    TEXT = ""
+  ),
+  c(
+    FLDNAME = "DOMAIN",
+    LABEL = "Domain Abbrevation"
+  ),
+  c(
+    FLDNAME = "USUBJID",
+    LABEL = "Unique Subject Identifier"
+  ),
+  c(
+    FLDNAME = "ORIGPROT",
+    LABEL = "Original Study Protocol"
+  ),
+  c(
+    FLDNAME = "LBGRPID",
+    LABEL = "Group ID",
+    TEXT = "Study Protocol of Data Collection"
+  ),
+  c(
+    FLDNAME = "LBSEQ",
+    LABEL = "Sequence Number"
+  ),
+  c(
+    FLDNAME = "LBTESTCD",
+    LABEL = "Lab Test or Examination Short Name"
+  ),
+  c(
+    FLDNAME = "LBTEST",
+    LABEL = "Lab Test or Examination Name"
+  ),
+  # c(
+  #   FLDNAME = "LBCAT",
+  #   LABEL = "Category for Lab Test"
+  # ),
+  # c(
+  #   FLDNAME = "LBSCAT",
+  #   LABEL = "Subcategory for Lab Test"
+  # ),
+  c(
+    FLDNAME = "LBORRES",
+    LABEL = "Result or Finding in Original Units"
+  ),
+  c(
+    FLDNAME = "LBORRESU",
+    LABEL = "Original Units"
+  ),
+  c(
+    FLDNAME = "LBSTRESC",
+    LABEL = "Character Result/Finding in Std Format"
+  ),
+  c(
+    FLDNAME = "LBSTRESN",
+    LABEL = "Numeric Result/Finding in Standard Units"
+  ),
+  c(
+    FLDNAME = "LBSTRESU",
+    LABEL = "Standard Units"
+  ),
+  c(
+    FLDNAME = "LBSTAT",
+    LABEL = "Completion Status"
+  ),
+  c(
+    FLDNAME = "LBREASND",
+    LABEL = "Reason Test Not Done"
+  ),
+  c(
+    FLDNAME = "LBSPEC",
+    LABEL = "Specimen Type"
+  ),
+  c(
+    FLDNAME = "LBSPCCND",
+    LABEL = "Specimen Condition"
+  ),
+  # c(
+  #   FLDNAME = "LBMETHOD",
+  #   LABEL = "Method of Test or Examination"
+  # ),
+  c(
+    FLDNAME = "LBNAM",
+    LABEL = "Vendor Name"
+  ),
+  c(
+    FLDNAME = "LBBLFL",
+    LABEL = "Baseline Flag"
+  ),
+  c(
+    FLDNAME = "VISITNUM",
+    LABEL = "Visit Number"
+  ),
+  c(
+    FLDNAME = "VISIT",
+    LABEL = "Visit Name"
+  ),
+  c(
+    FLDNAME = "VISCODE",
+    LABEL = "Visit Code"
+  ),
+  # c(
+  #   FLDNAME = "VISITDY",
+  #   LABEL = "(Planned*) Study Day of Visit"
+  # ),
+  c(
+    FLDNAME = "EPOCH",
+    LABEL = "Epoch"
+  ),
+  c(
+    FLDNAME = "LBDTC",
+    LABEL = "Date/Time of Specimen Collection"
+  ),
+  c(
+    FLDNAME = "LBDY",
+    LABEL = "Study Day of Specimen Collection"
+  )
+) %>%
+  tibble::as_tibble() %>%
+  relocate(c(FLDNAME, LABEL, TEXT)) %>%
+  mutate(TEXT = replace_na(TEXT, " ")) %>%
+  mutate(
+    DERIVED = TRUE,
+    TBLNAME = "LB",
+    CRFNAME = "[ Derived ] Laboratory Test Results"
+  )
+
+## ----lb-data-dic-print, eval = TRUE, echo = FALSE-----------------------------
+lb_data_dic %>%
+  select(FLDNAME, LABEL, TEXT) %>%
+  datatable(., paging = TRUE)
+
+## ----lb-prepare-labdata-1go2, eval = TRUE, echo = FALSE-----------------------
+common_cols <- c(
+  "ORIGPROT", "COLPROT", "ID", "PTID", "RID", "SITEID", "VISCODE", "VISCODE2",
+  "USERDATE", "USERDATE2", "RECNO", "ACCNO", "COVVIS", "EXAMDATE", "update_stamp"
+)
+lab_cols <- c(
+  "ORIGPROT", "COLPROT", "RID", "SITEID",
+  "VISCODE", "VISCODE2", "EXAMDATE"
+)
+
+# Lab data for ANDI1-GO-2 phases
+ADNI1GO2_CLINICAL_LABDATA <- LABDATA %>%
+  generate_oak_id_vars_adni(raw_src = "LABDATA") %>%
+  mutate(across(-all_of(c(common_cols, oak_id_vars())), as.character)) %>%
+  pivot_longer(
+    cols = everything() & -all_of(c(common_cols, oak_id_vars())),
+    names_to = "LBTESTCD",
+    values_to = "LBORRES"
+  ) %>%
+  select(-all_of(common_cols[!common_cols %in% lab_cols])) %>%
+  filter(LBORRES != -1) %>%
+  mutate(LBDTC = create_iso8601(as.character(EXAMDATE), .format = "y-m-d")) %>%
+  adjust_lab_visitcode()
+
+## ----lb-prepare-labdata-34, eval = TRUE, echo = FALSE, message = FALSE, results = 'hold'----
+# Lab data for ANDI3-4 phases
+ADNI34_CLINICAL_LABDATA <- URMC_LABDATA %>%
+  generate_oak_id_vars_adni(raw_src = "URMC_LABDATA") %>%
+  mutate(
+    LBNAM = "URMC",
+    TestID = ifelse(TestName %in% "Sodium", "NA", TestID)
+  ) %>%
+  mutate(across(ends_with(c("Date", "Time")), as.character))
+
+# Create LBDTC
+ADNI34_CLINICAL_LABDATA <- sdtm.oak::assign_datetime(
+  tgt_dat = ADNI34_CLINICAL_LABDATA %>%
+    select(-SampleDate, -SampleTime),
+  raw_dat = ADNI34_CLINICAL_LABDATA,
+  tgt_var = "LBDTC",
+  raw_var = c("SampleDate", "SampleTime"),
+  raw_fmt = c("y-m-d", "H:M:S")
+)
+
+## ----lb-prepare-labdata-34-cont, eval = TRUE, echo = FALSE--------------------
+ADNI34_CLINICAL_LABDATA <- ADNI34_CLINICAL_LABDATA %>%
+  # Adjust for lab test that were considered as 'not completed/done'
+  adjust_lab_status() %>%
+  adjust_lab_visitcode() %>%
+  mutate(
+    LBGRPID = COLPROT,
+    LBTESTCD = TestID,
+    LBTEST = TestName,
+    LBORRES = ResultValueConv_translated,
+    LBORRESU = UnitsConv,
+    LBORNRLO = LowerRangeConv,
+    LBORNRHI = UpperRangeConv,
+    LBSTRESC = ResultValueSI_translated,
+    LBSTRESN = as.numeric(ResultValueSI_translated),
+    LBSTRESU = UnitsSI,
+    LBSTNRLO = LowerRangeSI,
+    LBSTNRHI = UpperRangeSI,
+    LBFAST = Fasting,
+    LBSPCCND = Comments
+  )
+
+## ----lb-prepare-labdata-input, eval = TRUE, echo = FALSE----------------------
+CLINICAL_LB_TESTCD_LIST <- DATADIC %>%
+  filter(TBLNAME %in% "LABDATA") %>%
+  filter(!FLDNAME %in% common_cols) %>%
+  distinct(FLDNAME, TEXT) %>%
+  assert_uniq(FLDNAME) %>%
+  mutate(
+    LBTESTCD = FLDNAME,
+    LBTEST = str_remove_all(TEXT, paste0("Test |", FLDNAME, ";|\\(\\%\\)")),
+    LBTEST = str_trim(LBTEST),
+    LBORRESU = str_extract_all(TEXT, "\\(\\%\\)", simplify = TRUE),
+    LBORRESU = str_remove_all(LBORRESU, "[\\(\\)]"),
+    LBSTRESU = LBORRESU
+  ) %>%
+  select(LBTESTCD, LBTEST, LBORRESU, LBSTRESU) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.x), "", .x))) %>%
+  filter(LBTESTCD %in% ADNI34_CLINICAL_LABDATA$LBTESTCD)
+
+## ----lb-testcd-list, eval = TRUE, echo = FALSE--------------------------------
+LB_TESTCD_LIST <- bind_rows(
+  CLINICAL_LB_TESTCD_LIST,
+  get_biomarker_details(assay = "C2N"),
+  get_biomarker_details(assay = "Roche"),
+  get_biomarker_details(assay = "AlzBio3"),
+  get_biomarker_details(assay = "FQ")
+) %>%
+  select(SOURCE, LBNAM, LBTESTCD, LBTEST, LBORRESU, LBSTRESU, LBMETHOD)
+
+LB_TESTCD_LIST %>%
+  arrange(LBTESTCD) %>%
+  filter(!is.na(LBNAM)) %>%
+  arrange(SOURCE, LBNAM, LBMETHOD) %>%
+  select(SOURCE, LBNAM, LBMETHOD, LBTESTCD, LBTEST, LBORRESU, LBSTRESU) %>%
+  datatable(paging = TRUE, filter = "top")
+
+## ----lb-prepare-labdata-print, echo = TRUE, warning = FALSE, message = FALSE, results = 'asis', ref.label = c("lb-prepare-labdata-1go2", "lb-prepare-labdata-34", "lb-prepare-labdata-34-cont")----
+common_cols <- c(
+  "ORIGPROT", "COLPROT", "ID", "PTID", "RID", "SITEID", "VISCODE", "VISCODE2",
+  "USERDATE", "USERDATE2", "RECNO", "ACCNO", "COVVIS", "EXAMDATE", "update_stamp"
+)
+lab_cols <- c(
+  "ORIGPROT", "COLPROT", "RID", "SITEID",
+  "VISCODE", "VISCODE2", "EXAMDATE"
+)
+
+# Lab data for ANDI1-GO-2 phases
+ADNI1GO2_CLINICAL_LABDATA <- LABDATA %>%
+  generate_oak_id_vars_adni(raw_src = "LABDATA") %>%
+  mutate(across(-all_of(c(common_cols, oak_id_vars())), as.character)) %>%
+  pivot_longer(
+    cols = everything() & -all_of(c(common_cols, oak_id_vars())),
+    names_to = "LBTESTCD",
+    values_to = "LBORRES"
+  ) %>%
+  select(-all_of(common_cols[!common_cols %in% lab_cols])) %>%
+  filter(LBORRES != -1) %>%
+  mutate(LBDTC = create_iso8601(as.character(EXAMDATE), .format = "y-m-d")) %>%
+  adjust_lab_visitcode()
+# Lab data for ANDI3-4 phases
+ADNI34_CLINICAL_LABDATA <- URMC_LABDATA %>%
+  generate_oak_id_vars_adni(raw_src = "URMC_LABDATA") %>%
+  mutate(
+    LBNAM = "URMC",
+    TestID = ifelse(TestName %in% "Sodium", "NA", TestID)
+  ) %>%
+  mutate(across(ends_with(c("Date", "Time")), as.character))
+
+# Create LBDTC
+ADNI34_CLINICAL_LABDATA <- sdtm.oak::assign_datetime(
+  tgt_dat = ADNI34_CLINICAL_LABDATA %>%
+    select(-SampleDate, -SampleTime),
+  raw_dat = ADNI34_CLINICAL_LABDATA,
+  tgt_var = "LBDTC",
+  raw_var = c("SampleDate", "SampleTime"),
+  raw_fmt = c("y-m-d", "H:M:S")
+)
+ADNI34_CLINICAL_LABDATA <- ADNI34_CLINICAL_LABDATA %>%
+  # Adjust for lab test that were considered as 'not completed/done'
+  adjust_lab_status() %>%
+  adjust_lab_visitcode() %>%
+  mutate(
+    LBGRPID = COLPROT,
+    LBTESTCD = TestID,
+    LBTEST = TestName,
+    LBORRES = ResultValueConv_translated,
+    LBORRESU = UnitsConv,
+    LBORNRLO = LowerRangeConv,
+    LBORNRHI = UpperRangeConv,
+    LBSTRESC = ResultValueSI_translated,
+    LBSTRESN = as.numeric(ResultValueSI_translated),
+    LBSTRESU = UnitsSI,
+    LBSTNRLO = LowerRangeSI,
+    LBSTNRHI = UpperRangeSI,
+    LBFAST = Fasting,
+    LBSPCCND = Comments
+  )
+
+## ----lb-prepare-upenbiomk1, eval = TRUE, echo = FALSE-------------------------
+# Roche Elecsys Immunioassay
+upenn_roche_cols <- c("ABETA40", "ABETA42", "TAU", "PTAU")
+names(upenn_roche_cols) <- c("ABETA40", "ABETA42", "TPROT", "PTAU181")
+join_var_upenn <- paste0(c("ORIGPROT", "COLPROT", "RID", "EXAMDATE"), "_BM")
+names(join_var_upenn) <- str_remove_all(join_var_upenn, "\\_BM")
+
+UPENNBIOMK_ROCHE_DATA <- UPENNBIOMK_ROCHE_ELECSYS %>%
+  select(
+    ORIGPROT, COLPROT, RID, VISCODE2, EXAMDATE, RUNDATE, BATCH, COMMENT,
+    all_of(as.character(upenn_roche_cols))
+  ) %>%
+  generate_oak_id_vars_adni(raw_src = "UPENNBIOMK_ROCHE_ELECSYS") %>%
+  # Fuzzy join for actual study visit name/code
+  left_fuzzy_join(
+    data1 = .,
+    data2 = BIOMARK %>%
+      select(ORIGPROT, COLPROT, RID, EXAMDATE, VISCODE) %>%
+      filter(!is.na(EXAMDATE)) %>%
+      rename_with_list(., name_char = join_var_upenn, by_name = FALSE),
+    join_by = join_var_upenn,
+    main_cols = "EXAMDATE",
+    date_col = "EXAMDATE",
+    check_cols = "VISCODE",
+    relation = "one-to-many"
+  ) %>%
+  pivot_longer(
+    cols = all_of(as.character(upenn_roche_cols)),
+    names_to = "LBTESTCD",
+    values_to = "LBORRES"
+  ) %>%
+  mutate(
+    LBORRES = as.character(LBORRES),
+    LBDTC = create_iso8601(as.character(EXAMDATE), .format = "y-m-d")
+  )
+
+UPENNBIOMK_ROCHE_DATA <- UPENNBIOMK_ROCHE_DATA %>%
+  # Adjust comment by LBTETSCD
+  adjust_lab_comment(lab_data = .) %>%
+  # Create lab completion status
+  mutate(
+    LBSTAT = case_when(!is.na(COMMENT) & is.na(LBORRES) ~ "NOT DONE"),
+    LBREASND = case_when(!is.na(COMMENT) & is.na(LBORRES) ~ COMMENT),
+    LBTESTCD = factor(LBTESTCD,
+      levels = as.character(upenn_roche_cols),
+      labels = names(upenn_roche_cols)
+    ),
+    LBTESTCD = as.character(LBTESTCD)
+  ) %>%
+  # Add lab result limit values
+  left_join(
+    get_biomarker_details(assay = "Roche"),
+    by = c("BATCH", "LBTESTCD")
+  ) %>%
+  assert_non_missing(LBTEST)
+
+## ----lb-prepare-upennbiomk2, eval = TRUE, echo = FALSE------------------------
+# INNO_BIA AlzBio3 Immunoassay - Research Use Only (ROU)
+upenn_alzbio3_cols <- c("ABETA", "TAU", "PTAU")
+upenn_alzbio3_cols_label <- c("ABETA42", "TPROT", "PTAU181")
+upenn_alzbio3_cols <- c(
+  upenn_alzbio3_cols,
+  paste0(upenn_alzbio3_cols, "_RAW")
+)
+names(upenn_alzbio3_cols) <- c(
+  paste0(upenn_alzbio3_cols_label, "S"),
+  paste0(upenn_alzbio3_cols_label, "R")
+)
+
+UPENNBIOMK_ALZBIO3_DATA <- UPENNBIOMK_MASTER %>%
+  rename(all_of(c(
+    upenn_alzbio3_cols,
+    c("EXAMDATE" = "DRAWDTE", "VISCODE2" = "VISCODE")
+  ))) %>%
+  assert_uniq(all_of(c("ORIGPROT", "RID", "EXAMDATE", "BATCH"))) %>%
+  generate_oak_id_vars_adni(raw_src = "UPENNBIOMK_MASTER") %>%
+  left_fuzzy_join(
+    data1 = .,
+    data2 = BIOMARK %>%
+      select(ORIGPROT, RID, EXAMDATE, VISCODE, COLPROT) %>%
+      filter(!is.na(EXAMDATE)) %>%
+      rename_with_list(., name_char = join_var_upenn[-2], by_name = FALSE),
+    join_by = join_var_upenn[-2],
+    main_cols = "EXAMDATE",
+    date_col = "EXAMDATE",
+    check_cols = c("COLPROT", "VISCODE"),
+    relation = "one-to-many"
+  )
+
+UPENNBIOMK_ALZBIO3_DATA <- UPENNBIOMK_ALZBIO3_DATA %>%
+  pivot_longer(
+    cols = all_of(names(upenn_alzbio3_cols)),
+    names_to = "LBTESTCD",
+    values_to = "LBORRES"
+  ) %>%
+  mutate(
+    LBORRES = as.character(LBORRES),
+    LBDTC = create_iso8601(as.character(EXAMDATE), .format = "y-m-d")
+  ) %>%
+  left_join(
+    get_biomarker_details(assay = "AlzBio3"),
+    by = "LBTESTCD"
+  ) %>%
+  assert_non_missing(LBTEST)
+
+## ----lb-prepare-upennbiomk3, eval = TRUE, echo = FALSE------------------------
+# Fujirebio Lumipulse G1200 and Quanterix HD-X
+fq_cols <- c(
+  "pT217_F", "AB42_F", "AB40_F", "AB42_AB40_F",
+  "pT217_AB42_F", "NfL_Q", "GFAP_Q"
+)
+names(fq_cols) <- c(
+  "PT217", "AB42", "AB40", "AB42AB40",
+  "PT217AB42", "NFL", "GFAP"
+)
+
+UPENN_PLASMA_FQ_DATA <- UPENN_PLASMA_FUJIREBIO_QUANTERIX %>%
+  generate_oak_id_vars_adni(raw_src = "UPENN_PLASMA_FUJIREBIO_QUANTERIX") %>%
+  select(-update_stamp) %>%
+  rename(all_of(fq_cols)) %>%
+  pivot_longer(
+    cols = all_of(names(fq_cols)),
+    names_to = "LBTESTCD",
+    values_to = "LBORRES"
+  ) %>%
+  left_join(
+    get_biomarker_details(assay = "FQ"),
+    by = "LBTESTCD"
+  ) %>%
+  assert_non_missing(LBTEST) %>%
+  mutate(
+    LBORRES = as.character(as.numeric(LBORRES)),
+    LBDTC = create_iso8601(as.character(EXAMDATE), .format = "y-m-d"),
+    LBANTREG = Primary
+  ) %>%
+  filter(!is.na(VISCODE))
+
+## ----lb-prepare-c2n-data------------------------------------------------------
+# C2N Blood Plasma Result ----
+c2n_cols <- c(
+  "pT217_C2N", "npT217_C2N", "AB42_C2N", "AB40_C2N", "AB42_AB40_C2N",
+  "pT217_npT217_C2N", "APS2_C2N"
+)
+names(c2n_cols) <- c(
+  "PT217", "NPT217", "AB42", "AB40",
+  "AB42AB40", "PTNPT217", "APS2"
+)
+
+C2N_PLASMA_DATA <- C2N_PRECIVITYAD2_PLASMA %>%
+  generate_oak_id_vars_adni(raw_src = "C2N_PRECIVITYAD2_PLASMA") %>%
+  rename(all_of(c2n_cols)) %>%
+  select(
+    all_of(c(oak_id_vars(), names(c2n_cols))),
+    ORIGPROT, COLPROT, RID, VISCODE,
+    EXAMDATE,
+    LBANTREG = Primary, LBSPCCND = Comments
+  ) %>%
+  mutate(across(all_of(names(c2n_cols)), as.character)) %>%
+  pivot_longer(
+    cols = all_of(names(c2n_cols)),
+    names_to = "LBTESTCD",
+    values_to = "LBORRES"
+  ) %>%
+  mutate(
+    LBSPEC = "PLASMA",
+    LBDTC = create_iso8601(as.character(EXAMDATE), .format = "y-m-d")
+  ) %>%
+  left_join(
+    get_biomarker_details(assay = "C2N"),
+    by = "LBTESTCD"
+  ) %>%
+  assert_non_missing(LBTEST)
+
+## ----generate-lb--------------------------------------------------------------
+LB <- bind_rows(
+  C2N_PLASMA_DATA, ADNI1GO2_CLINICAL_LABDATA,
+  UPENNBIOMK_ROCHE_DATA, UPENNBIOMK_ALZBIO3_DATA,
+  UPENN_PLASMA_FQ_DATA
+) %>%
+  mutate(
+    LBGRPID = COLPROT,
+    LBSTRESC = as.character(LBORRES),
+    LBSTRESN = as.numeric(LBORRES)
+  ) %>%
+  bind_rows(ADNI34_CLINICAL_LABDATA) %>%
+  assert_non_missing(LBGRPID) %>%
+  # Future work to add lab result category
+  # set_dom_test(
+  #    .data_list = LB_TESTCD_LIST %>%
+  #     select(LBTESTCD, LBTEST, LBORRESU, LBSTRESU),
+  #   merge_by = "LBTESTCD"
+  # ) %>%
+  derive_usubjid() %>%
+  assign_studyid_domain(domain = "LB") %>%
+  assign_visit_attr(check_missing_visnum = FALSE) %>%
+  assign_epoch() %>%
+  derive_blfl_adni(
+    dm_domain = DM,
+    tgt_var = "LBBLFL",
+    .strict = FALSE
+  ) %>%
+  derive_study_day_adni(
+    dm_domain = DM,
+    domain = "LB"
+  ) %>%
+  derive_seq(
+    tgt_var = "LBSEQ",
+    rec_vars = c("USUBJID", "LBTESTCD", "LBGRPID")
+  ) %>%
+  assign_vars_label(data_dict = lb_data_dic, .strict = FALSE)
+
+## ----gf-data-dic, echo = FALSE------------------------------------------------
+gf_data_dic <- bind_rows(
+  c(
+    FLDNAME = "STUDYID",
+    LABEL = "Study Identifier",
+    TEXT = ""
+  ),
+  c(
+    FLDNAME = "DOMAIN",
+    LABEL = "Domain Abbrevation"
+  ),
+  c(
+    FLDNAME = "USUBJID",
+    LABEL = "Unique Subject Identifier"
+  ),
+  c(
+    FLDNAME = "GFSEQ",
+    LABEL = "Sequence Number"
+  ),
+  c(
+    FLDNAME = "GFGRPID",
+    LABEL = "Group ID",
+    TEXT = "Study Protocol of Data Collection"
+  ),
+  c(
+    FLDNAME = "GFTESTCD",
+    LABEL = "Short Name of Genomic Measurement"
+  ),
+  c(
+    FLDNAME = "GFTEST",
+    LABEL = "Name of Genomic Measurement"
+  ),
+  c(
+    FLDNAME = "GFSTDTL",
+    LABEL = "Measurement, Test, or Examination Detail"
+  ), # GENOTYPE
+  c(
+    FLDNAME = "GFORRES",
+    LABEL = "Result or Finding in Original Units"
+  ),
+  c(
+    FLDNAME = "GFSTRESC",
+    LABEL = "Character Result/Finding in Std Format"
+  ),
+  c(
+    FLDNAME = "VISITNUM",
+    LABEL = "Visit Number"
+  ),
+  c(
+    FLDNAME = "VISIT",
+    LABEL = "Visit Name"
+  ),
+  # c(
+  #   FLDNAME = "VISITDY",
+  #   LABEL = "(Planned*) Study Day of Visit"
+  # ),
+  c(
+    FLDNAME = "GFDTC",
+    LABEL = "Date/Time of Specimen Collection"
+  ),
+  c(
+    FLDNAME = "GFDY",
+    LABEL = "Study Day of Specimen Collection"
+  )
+) %>%
+  tibble::as_tibble() %>%
+  relocate(c(FLDNAME, LABEL, TEXT)) %>%
+  mutate(TEXT = replace_na(TEXT, " ")) %>%
+  mutate(
+    DERIVED = TRUE,
+    TBLNAME = "GF",
+    CRFNAME = "[ Derived ] Genomics Findings"
+  )
+
+## ----gf-data-dic-print, eval = TRUE, echo = FALSE-----------------------------
+gf_data_dic %>%
+  select(FLDNAME, LABEL, TEXT) %>%
+  datatable(., paging = TRUE)
+
+## ----generate-gf--------------------------------------------------------------
+GF <- APOERES %>%
+  assert_uniq(RID) %>%
+  generate_oak_id_vars_adni(raw_src = "APOERES") %>%
+  mutate(
+    GFTESTCD = "APOE",
+    GFTEST = "Apolipoprotein E",
+    GFGRPID = COLPROT,
+    GFSTDTL = "GENOTYPE",
+    GFORRES = GENOTYPE,
+    GFSTRESC = str_replace_all(GENOTYPE, "(\\d+)", "ε\\1"),
+    GFDTC = create_iso8601(as.character(APTESTDT), .format = "y-m-d"),
+  ) %>%
+  derive_usubjid() %>%
+  assign_studyid_domain(domain = "GF") %>%
+  assign_visit_attr(check_missing_visnum = FALSE) %>%
+  derive_study_day_adni(
+    dm_domain = DM,
+    domain = "GF"
+  ) %>%
+  derive_seq(
+    tgt_var = "GFSEQ",
+    rec_vars = c("USUBJID", "GFTESTCD", "GFGRPID")
+  ) %>%
+  assign_vars_label(data_dict = gf_data_dic)
+
+## ----vs-data-dic, echo = FALSE------------------------------------------------
+vs_data_dic <- bind_rows(
+  c(
+    FLDNAME = "STUDYID",
+    LABEL = "Study Identifier",
+    TEXT = ""
+  ),
+  c(
+    FLDNAME = "DOMAIN",
+    LABEL = "Domain Abbrevation"
+  ),
+  c(
+    FLDNAME = "USUBJID",
+    LABEL = "Unique Subject Identifier"
+  ),
+  c(
+    FLDNAME = "VSSEQ",
+    LABEL = "Sequence Number"
+  ),
+  c(
+    FLDNAME = "VSGRPID",
+    LABEL = "Group ID",
+    TEXT = "Study Protocol of Data Collection"
+  ),
+  c(
+    FLDNAME = "VSTESTCD",
+    LABEL = "Vital Signs Test Short Name"
+  ),
+  c(
+    FLDNAME = "VSTEST",
+    LABEL = "Vital Signs Test Name"
+  ),
+  c(
+    FLDNAME = "VSORRES",
+    LABEL = "Result or Finding in Original Units"
+  ),
+  c(
+    FLDNAME = "VSORRESU",
+    LABEL = "Original Units"
+  ),
+  c(
+    FLDNAME = "VSSTRESC",
+    LABEL = "Character Result/Finding in Std Format"
+  ),
+  c(
+    FLDNAME = "VSSTRESN",
+    LABEL = "Numeric Result/Finding in Standard Units"
+  ),
+  c(
+    FLDNAME = "VSSTRESU",
+    LABEL = "Standard Units"
+  ),
+  c(
+    FLDNAME = "VSLOC",
+    LABEL = "Location of Vital Signs Measurment"
+  ),
+  c(
+    FLDNAME = "VSBLFL",
+    LABEL = "Baseline Flag"
+  ),
+  c(
+    FLDNAME = "VSDRVFL",
+    LABEL = "Derived Flag"
+  ),
+  c(
+    FLDNAME = "VISITNUM",
+    LABEL = "Visit Number"
+  ),
+  c(
+    FLDNAME = "VISIT",
+    LABEL = "Visit Name"
+  ),
+  # c(
+  #   FLDNAME = "VISITDY",
+  #   LABEL = "(Planned*) Study Day of Visit"
+  # ),
+  c(
+    FLDNAME = "EPOCH",
+    LABEL = "Epoch"
+  ),
+  c(
+    FLDNAME = "VSDTC",
+    LABEL = "Date/Time of Measurements"
+  ),
+  c(
+    FLDNAME = "VSDY",
+    LABEL = "Study Day of Vital Signs"
+  )
+) %>%
+  tibble::as_tibble() %>%
+  relocate(c(FLDNAME, LABEL, TEXT)) %>%
+  mutate(TEXT = replace_na(TEXT, " ")) %>%
+  mutate(
+    DERIVED = TRUE,
+    TBLNAME = "VS",
+    CRFNAME = "[ Derived ] Vital Signs"
+  )
+
+## ----vs-data-dic-print, eval = TRUE, echo = FALSE-----------------------------
+vs_data_dic %>%
+  select(FLDNAME, LABEL, TEXT) %>%
+  datatable(., paging = TRUE)
+
+## ----vs-testcd-list, eval = TRUE, echo = FALSE--------------------------------
+# Required checking variable name length and test labels
+VS_TESTCD_LIST <- bind_rows(
+  c(
+    VSTESTCD = "WEIGHT",
+    VSTEST = "Weight",
+    VSORRESU = "Pound (LB) or Kilogram (kg)",
+    VSSTRESU = "kg"
+  ),
+  c(
+    VSTESTCD = "HEIGHT",
+    VSTEST = "Height",
+    VSORRESU = "Centimeter (cm) or Inches (inch)",
+    VSSTRESU = "m"
+  ),
+  c(
+    VSTESTCD = "TEMP",
+    VSTEST = "Temperature",
+    VSORRESU = "Fahrenheit (F) or Celsius (C)",
+    VSSTRESU = "C"
+  ),
+  c(
+    VSTESTCD = "DIABP",
+    VSTEST = "Diastolic Blood Pressure",
+    VSORRESU = "mmHg",
+    VSSTRESU = "mmHg"
+  ),
+  c(
+    VSTESTCD = "SYSBP",
+    VSTEST = "Diastolic Blood Pressure",
+    VSORRESU = "mmHg",
+    VSSTRESU = "mmHg"
+  ),
+  c(
+    VSTESTCD = "PLUSE",
+    VSTEST = "Pluse Rate",
+    VSORRESU = "beats/min",
+    VSSTRESU = "beats/min"
+  ),
+  c(
+    VSTESTCD = "RESP",
+    VSTEST = "Respiratory Rate",
+    VSORRESU = "breaths/min",
+    VSSTRESU = "breaths/min"
+  ),
+) %>%
+  mutate(SOURCE = "VITALS")
+
+VS_TESTCD_LIST %>%
+  arrange(SOURCE, VSTESTCD) %>%
+  select(SOURCE, VSTESTCD, VSTEST, VSORRESU, VSSTRESU) %>%
+  datatable()
+
+## ----generate-vs0-------------------------------------------------------------
+# Wide format
+VS <- VITALS %>%
+  mutate(VSDTC = create_iso8601(as.character(VISDATE), .format = "y-m-d")) %>%
+  select(
+    ORIGPROT, COLPROT, RID, VISCODE, VSDTC,
+    VSWEIGHT, VSWTUNIT, VSHEIGHT, VSHTUNIT, VSBPSYS, VSBPDIA, VSPULSE,
+    VSRESP, VSTEMP, VSTMPSRC, VSTMPUNT, VSHGTSC
+  ) %>%
+  generate_oak_id_vars_adni(raw_src = "VITALS") %>%
+  mutate(across(c(VSWEIGHT, VSHEIGHT, VSTEMP), ~ ifelse(.x == -1, NA, .x))) %>%
+  verify(all(VSWTUNIT %in% c("kilograms", "pounds") | is.na(VSWTUNIT))) %>%
+  verify(all(VSHTUNIT %in% c("centimeters", "inches") | is.na(VSHTUNIT))) %>%
+  verify(all(VSTMPUNT %in% c("Fahrenheit", "Celsius") | is.na(VSTMPUNT))) %>%
+  mutate(
+    VSWTUNIT_TRANSLATED = case_when(
+      VSWTUNIT %in% "kilograms" ~ "kg",
+      VSWTUNIT %in% "pounds" ~ "LB"
+    ),
+    VSHTUNIT_TRANSLATED = case_when(
+      VSHTUNIT %in% "centimeters" ~ "cm",
+      VSHTUNIT %in% "inches" ~ "inch"
+    ),
+    VSTMPUNT_TRANSLATED = case_when(
+      VSTMPUNT %in% "Fahrenheit" ~ "F",
+      VSTMPUNT %in% "Celsius" ~ "C"
+    ),
+  ) %>%
+  unite("WEIGHT", VSWEIGHT, VSWTUNIT_TRANSLATED, sep = "-") %>%
+  unite("HEIGHT", VSHEIGHT, VSHTUNIT_TRANSLATED, sep = "-") %>%
+  unite("TEMP", VSTEMP, VSTMPUNT_TRANSLATED, VSTMPSRC, sep = "-") %>%
+  mutate(
+    DIABP = ifelse(!is.na(VSBPDIA), paste0(VSBPDIA, "-", "mmHg"), NA),
+    SYSBP = ifelse(!is.na(VSBPSYS), paste0(VSBPSYS, "-", "mmHg"), NA),
+    PLUSE = ifelse(!is.na(VSPULSE), paste0(VSPULSE, "-", "beats/min"), NA),
+    RESP = ifelse(!is.na(VSRESP), paste0(VSRESP, "-", "breaths/min"), NA)
+  )
+
+## ----generate-vs1-------------------------------------------------------------
+# Long format
+VS <- VS %>%
+  pivot_longer(
+    cols = c(WEIGHT, HEIGHT, TEMP, DIABP, SYSBP, PLUSE, RESP),
+    names_to = "VSTESTCD",
+    values_to = "VALUE"
+  ) %>%
+  set_dom_test(
+    .data_list = VS_TESTCD_LIST %>%
+      select(VSTESTCD, VSTEST),
+    merge_by = "VSTESTCD"
+  ) %>%
+  separate(VALUE, into = c("VSORRES", "VSORRESU", "VSLOC"), sep = "-") %>%
+  mutate(VSLOC = str_to_upper(VSLOC)) %>%
+  mutate(VSSTRESU = case_when(
+    VSORRESU %in% c("F", "C") ~ "C",
+    VSORRESU %in% c("cm", "inch") ~ "cm",
+    VSORRESU %in% c("kg", "LB") ~ "kg",
+    VSORRESU %in% c("mmHg", "beats/min", "breaths/min") ~ VSORRESU
+  )) %>%
+  # Unit conversion: conv_unit
+  mutate(
+    FROM_UNIT = case_when(
+      VSORRESU %in% "LB" ~ "lbs",
+      VSORRESU %in% c("C", "F", "cm", "inch", "kg") ~ VSORRESU,
+      TRUE ~ NA_character_
+    ),
+    TO_UNIT = case_when(
+      VSSTRESU %in% c("C", "kg", "cm") ~ VSSTRESU,
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  rowwise() %>%
+  mutate(
+    VSSTRESN = ifelse(
+      VSTESTCD %in% c("WEIGHT", "HEIGHT", "TEMP") & !is.na(FROM_UNIT),
+      conv_unit(as.numeric(VSORRES), from = FROM_UNIT, to = TO_UNIT),
+      ifelse(VSTESTCD %in% c("DIABP", "SYSBP", "PLUSE", "RESP"),
+        as.numeric(VSORRES), NA_real_
+      )
+    )
+  ) %>%
+  mutate(
+    VSGRPID = COLPROT,
+    VSSTRESN = round(VSSTRESN, digits = 1),
+    VSSTRESC = as.character(VSSTRESN),
+    VSDRVFL = case_when(!is.na(FROM_UNIT) & FROM_UNIT != TO_UNIT ~ "Yes")
+  ) %>%
+  as_tibble() %>%
+  assert_non_missing(COLPROT, VISCODE, VSTEST)
+
+## ----generate-vs2-------------------------------------------------------------
+VS <- VS %>%
+  derive_usubjid() %>%
+  assign_studyid_domain(domain = "VS") %>%
+  assign_visit_attr() %>%
+  assign_epoch() %>%
+  derive_blfl_adni(
+    dm_domain = DM,
+    tgt_var = "VSBLFL"
+  ) %>%
+  derive_study_day_adni(
+    dm_domain = DM,
+    domain = "VS"
+  ) %>%
+  derive_seq(
+    tgt_var = "VSSEQ",
+    rec_vars = c("USUBJID", "VSTESTCD", "VSGRPID")
+  ) %>%
+  assign_vars_label(data_dict = vs_data_dic)
+
+## -----------------------------------------------------------------------------
+
