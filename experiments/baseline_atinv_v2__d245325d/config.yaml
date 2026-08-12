@@ -1,0 +1,75 @@
+data:
+  adni:
+    adas_csv: /content/drive/MyDrive/ADNI/ADNI_data/_unzipped/ADAS_31Jul2026.csv
+    adnimerge_csv: null
+    apoe_csv: /content/drive/MyDrive/ADNI/ADNI_data/_unzipped/All_Subjects_APOERES_26Jul2026.csv
+    blood_csv: /content/drive/MyDrive/ADNI/ADNI_data/_unzipped/All_Subjects_UPENN_PLASMA_FUJIREBIO_QUANTERIX_26Jul2026.csv
+    cdr_csv: /content/drive/MyDrive/ADNI/ADNI_data/CDR_31Jul2026.csv
+    csf_biomarker_csv: /content/drive/MyDrive/ADNI/ADNI_data/_unzipped/All_Subjects_UPENNBIOMK_ROCHE_ELECSYS_26Jul2026.csv
+    dxsum_csv: /content/drive/MyDrive/ADNI/ADNI_data/_unzipped/DXSUM_31Jul2026.csv
+    mmse_csv: /content/drive/MyDrive/ADNI/ADNI_data/MMSE_31Jul2026.csv
+    mri_roi_csv: null
+    pet_roi_csv: null
+    visit_window_months: 6
+  axes:
+  - A
+  - T
+  - I
+  - N
+  - V
+  max_modality_dropout: 0.0
+  modalities:
+  - blood
+  - csf
+  - mri
+  - pet
+  - genetics
+  - cognition
+  mode: adni_csv
+  n_rois: 1
+  normalize: true
+  synthetic:
+    n_patients: 200
+    n_visits_max: 8
+    n_visits_min: 3
+    visit_gap_months_mean: 6
+  train_frac: 0.7
+  val_frac: 0.15
+experiment:
+  modality_dropout_seed: 42
+  model_init_seed: 42
+  name: baseline_atinv_v2
+  output_root: /content/drive/MyDrive/ADNI/adni-latent-diffusion/experiments
+  split_seed: 42
+loss:
+  anchor_weight: 0.5
+  diag_aux_weight: 0.3
+  kl_weight: 0.1
+  ordering_weight: 0.2
+  recon_weight: 1.0
+model:
+  adjacency_csv: null
+  graph_init: identity
+  hidden_dim: 128
+  latent_dim_per_axis: 8
+  learnable_graph: true
+  max_months_per_substep: 3.0
+  max_substeps: 64
+  noise_scale_init: 0.05
+  reaction_heads: 4
+  reaction_layers: 2
+  reaction_type: transformer
+  sde_steps_per_interval: 4
+  z_clip: 20.0
+training:
+  amp: true
+  batch_size: 8
+  checkpoint_every_steps: 200
+  early_stop_patience: 30
+  epochs: 200
+  grad_clip: 1.0
+  log_every_steps: 20
+  lr: 0.001
+  num_workers: 2
+  resume: true
+  weight_decay: 1.0e-05

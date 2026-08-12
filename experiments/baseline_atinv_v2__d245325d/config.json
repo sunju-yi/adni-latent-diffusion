@@ -1,0 +1,86 @@
+{
+  "experiment": {
+    "name": "baseline_atinv_v2",
+    "model_init_seed": 42,
+    "split_seed": 42,
+    "modality_dropout_seed": 42,
+    "output_root": "/content/drive/MyDrive/ADNI/adni-latent-diffusion/experiments"
+  },
+  "data": {
+    "mode": "adni_csv",
+    "n_rois": 1,
+    "axes": [
+      "A",
+      "T",
+      "I",
+      "N",
+      "V"
+    ],
+    "modalities": [
+      "blood",
+      "csf",
+      "mri",
+      "pet",
+      "genetics",
+      "cognition"
+    ],
+    "train_frac": 0.7,
+    "val_frac": 0.15,
+    "normalize": true,
+    "max_modality_dropout": 0.0,
+    "synthetic": {
+      "n_patients": 200,
+      "n_visits_min": 3,
+      "n_visits_max": 8,
+      "visit_gap_months_mean": 6
+    },
+    "adni": {
+      "dxsum_csv": "/content/drive/MyDrive/ADNI/ADNI_data/_unzipped/DXSUM_31Jul2026.csv",
+      "cdr_csv": "/content/drive/MyDrive/ADNI/ADNI_data/CDR_31Jul2026.csv",
+      "mmse_csv": "/content/drive/MyDrive/ADNI/ADNI_data/MMSE_31Jul2026.csv",
+      "adas_csv": "/content/drive/MyDrive/ADNI/ADNI_data/_unzipped/ADAS_31Jul2026.csv",
+      "apoe_csv": "/content/drive/MyDrive/ADNI/ADNI_data/_unzipped/All_Subjects_APOERES_26Jul2026.csv",
+      "blood_csv": "/content/drive/MyDrive/ADNI/ADNI_data/_unzipped/All_Subjects_UPENN_PLASMA_FUJIREBIO_QUANTERIX_26Jul2026.csv",
+      "csf_biomarker_csv": "/content/drive/MyDrive/ADNI/ADNI_data/_unzipped/All_Subjects_UPENNBIOMK_ROCHE_ELECSYS_26Jul2026.csv",
+      "mri_roi_csv": null,
+      "pet_roi_csv": null,
+      "adnimerge_csv": null,
+      "visit_window_months": 6
+    }
+  },
+  "model": {
+    "latent_dim_per_axis": 8,
+    "hidden_dim": 128,
+    "reaction_type": "transformer",
+    "reaction_layers": 2,
+    "reaction_heads": 4,
+    "learnable_graph": true,
+    "graph_init": "identity",
+    "adjacency_csv": null,
+    "sde_steps_per_interval": 4,
+    "max_months_per_substep": 3.0,
+    "max_substeps": 64,
+    "z_clip": 20.0,
+    "noise_scale_init": 0.05
+  },
+  "training": {
+    "batch_size": 8,
+    "epochs": 200,
+    "lr": 0.001,
+    "weight_decay": 1e-05,
+    "grad_clip": 1.0,
+    "amp": true,
+    "checkpoint_every_steps": 200,
+    "log_every_steps": 20,
+    "resume": true,
+    "early_stop_patience": 30,
+    "num_workers": 2
+  },
+  "loss": {
+    "recon_weight": 1.0,
+    "kl_weight": 0.1,
+    "anchor_weight": 0.5,
+    "ordering_weight": 0.2,
+    "diag_aux_weight": 0.3
+  }
+}
